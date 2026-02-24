@@ -10,7 +10,11 @@ app.use(express.json({ limit: "5mb" }));
 app.use((req, res, next) => {
   const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
   const origin = req.headers.origin;
-  if (origin && allowed.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+
+  if (origin && allowed.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
 
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
@@ -19,7 +23,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ FIX: Always use DATABASE_URL + SSL for managed Postgres
+// --- request logger (IMPORTANT: before routes)
+app.use((req, res, next) => {
+  console.log("REQ", req.method, req.url);
+  next();
+});
+
+// ✅ Health routes (ONE)
+app.get("/", (req, res) => res.status(200).send("API running ✅"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+
+// ✅ Postgres pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
@@ -104,7 +118,7 @@ async function initDb() {
       id bigserial primary key,
       code text not null unique,
       title text not null,
-      kind text not null default 'account', -- account, other
+      kind text not null default 'account',
       age_pots int not null default 0,
       bucks int not null default 0,
       price_int bigint not null default 0,
@@ -119,7 +133,7 @@ async function initDb() {
     create table if not exists orders (
       id bigserial primary key,
       user_id bigint references users(id),
-      status text not null default 'pending', -- pending, paid, fulfilled, canceled
+      status text not null default 'pending',
       cart jsonb not null default '[]'::jsonb,
       total_int bigint not null default 0,
       created_at timestamptz not null default now()
@@ -133,9 +147,9 @@ async function initDb() {
     );
 
     create table if not exists payment_slots (
-      slot int primary key, -- 1..15
+      slot int primary key,
       title text not null default '',
-      item_key text not null default '', -- e.g. ride_potion or santa_dog
+      item_key text not null default '',
       points_per_unit int not null default 0,
       image_url text,
       enabled boolean not null default false
@@ -144,11 +158,11 @@ async function initDb() {
     create table if not exists expected_payments (
       id bigserial primary key,
       user_id bigint references users(id),
-      type text not null,                  -- slot / manual
-      expected jsonb not null,             -- {"ride_potion":2}
-      points_to_credit bigint not null,    -- total points to credit when matched
+      type text not null,
+      expected jsonb not null,
+      points_to_credit bigint not null,
       receiver_account text not null,
-      status text not null default 'pending', -- pending, matched, expired
+      status text not null default 'pending',
       created_at timestamptz not null default now()
     );
 
@@ -160,14 +174,12 @@ async function initDb() {
     );
   `);
 
-  // default setting: rate_agepots_per_token = 80
   await pool.query(`
     insert into settings (key,value)
     values ('rate_agepots_per_token','80')
     on conflict (key) do nothing;
   `);
 
-  // seed 15 empty slots if not present
   for (let i = 1; i <= 15; i++) {
     await pool.query(
       `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
@@ -183,16 +195,7 @@ async function computePriceFromRate(agePots) {
   return Math.ceil(Number(agePots || 0) / rate);
 }
 
-// ----------------- ROUTES -----------------
-app.get("/", (req, res) => res.send("API running ✅"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-app.use((req, res, next) => {
-  console.log(req.method, req.url);
-  next();
-});
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-/** AUTH */
+// ----------------- AUTH -----------------
 app.post("/api/auth/register", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
@@ -228,11 +231,12 @@ app.get("/api/me", requireAuth, async (req, res) => {
   res.json({ ok: true, me: u.rows[0] });
 });
 
-/** SETTINGS (rates) */
+// ----------------- SETTINGS -----------------
 app.get("/api/settings", async (req, res) => {
   const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
   res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 80) });
 });
+
 app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   const rate = Math.max(1, Number(req.body?.rate_agepots_per_token || 80));
   await pool.query(
@@ -243,7 +247,7 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   res.json({ ok: true, rate });
 });
 
-/** PRODUCTS (accounts) */
+// ----------------- PRODUCTS -----------------
 app.get("/api/products", async (req, res) => {
   const rows = await pool.query(`
     select id,code,title,kind,age_pots,bucks,price_int,stock_int,note,sold,purchases_count
@@ -259,11 +263,8 @@ app.post("/api/admin/products/add", requireAdmin, async (req, res) => {
   const age_pots = Number(req.body?.age_pots || 0);
   const bucks = Number(req.body?.bucks || 0);
   const note = String(req.body?.note || "").trim();
-
   if (!code || !title) return res.status(400).json({ ok: false, error: "code + title required" });
-
   const price_int = await computePriceFromRate(age_pots);
-
   await pool.query(
     `insert into products (code,title,kind,age_pots,bucks,price_int,stock_int,note)
      values ($1,$2,'account',$3,$4,$5,1,$6)`,
@@ -288,7 +289,7 @@ app.post("/api/admin/products/mark-sold", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-/** ORDERS */
+// ----------------- ORDERS -----------------
 app.post("/api/orders/create", requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
@@ -325,7 +326,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   res.json({ ok: true, order: created.rows[0] });
 });
 
-/** Payment slots */
+// ----------------- PAYMENT SLOTS -----------------
 app.get("/api/payment-slots", async (req, res) => {
   const rows = await pool.query(
     `select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`
@@ -354,7 +355,6 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
   const qty = Math.max(1, Number(req.body?.qty || 1));
-
   if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
 
   const s = await pool.query(`select enabled,item_key,points_per_unit from payment_slots where slot=$1`, [slot]);
@@ -363,8 +363,7 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   const item_key = s.rows[0].item_key;
   const points = Number(s.rows[0].points_per_unit) * qty;
 
-  const expected = {};
-  expected[item_key] = qty;
+  const expected = { [item_key]: qty };
 
   const ins = await pool.query(
     `insert into expected_payments (user_id,type,expected,points_to_credit,receiver_account)
@@ -375,7 +374,7 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   res.json({ ok: true, expected_payment: ins.rows[0], expected, points });
 });
 
-/** Inventory ingest */
+// ----------------- INVENTORY INGEST -----------------
 app.post("/inventory", requireInventoryKey, async (req, res) => {
   const receiver_account = String(req.body?.user || "unknown");
   const snapshot = req.body;
@@ -412,7 +411,7 @@ app.post("/inventory", requireInventoryKey, async (req, res) => {
   res.json({ ok: true, delta, matched });
 });
 
-/** Leaderboard */
+// ----------------- LEADERBOARD + MY ACCOUNTS -----------------
 app.get("/api/leaderboard", async (req, res) => {
   const rows = await pool.query(`
     select product_code, sum(qty)::int as buys
@@ -424,7 +423,6 @@ app.get("/api/leaderboard", async (req, res) => {
   res.json({ ok: true, leaderboard: rows.rows });
 });
 
-/** My orders */
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
   const rows = await pool.query(
     `select id,status,cart,total_int,created_at from orders where user_id=$1 order by id desc`,
@@ -433,19 +431,16 @@ app.get("/api/my-accounts", requireAuth, async (req, res) => {
   res.json({ ok: true, orders: rows.rows });
 });
 
-// ✅ FIX: bind to 0.0.0.0 + use Railway PORT
+// ✅ Railway-safe start
 const PORT = Number(process.env.PORT || 3000);
-
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ listening on", PORT);
-});
+const server = app.listen(PORT, "0.0.0.0", () => console.log("✅ listening on", PORT));
 
 process.on("SIGTERM", () => {
   console.log("⚠️ SIGTERM received — shutting down");
   server.close(() => process.exit(0));
 });
 
-// ✅ FIX: DB init cannot kill the server
+// Start DB init AFTER listen (and do not crash server)
 initDb()
   .then(() => console.log("✅ DB ready"))
   .catch((e) => console.error("❌ DB init error (server still running):", e?.message || e));
