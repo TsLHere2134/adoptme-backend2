@@ -421,6 +421,10 @@ app.get("/api/my-accounts", requireAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ listening on", PORT));
 
-initDb().catch(e => console.error("DB init error:", e));
+app.get("/", (req, res) => res.send("API running ✅"));
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("✅ listening on", PORT);
+});
