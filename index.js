@@ -306,9 +306,8 @@ app.get("/inventory/latest/:receiver_account", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-initDb()
-  .then(() => app.listen(PORT, () => console.log("✅ listening on", PORT)))
-  .catch((e) => {
-    console.error("DB init failed:", e);
-    process.exit(1);
-  });
+app.listen(PORT, () => console.log("✅ listening on", PORT));
+
+initDb().catch((e) => {
+  console.error("DB init failed (server still running):", e);
+});
