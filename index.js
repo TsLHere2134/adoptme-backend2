@@ -1,18 +1,18 @@
 import express from "express";
-import crypto from "crypto";
 import pg from "pg";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
+// --- CORS (website can call API)
 app.use((req, res, next) => {
   const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
   const origin = req.headers.origin;
-  if (origin && allowed.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-user-token");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (origin && allowed.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -23,27 +23,95 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL?.includes("railway") ? { rejectUnauthorized: false } : undefined,
 });
 
-const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
-if (!INVENTORY_API_KEY) console.warn("⚠️ Set INVENTORY_API_KEY in Railway Variables.");
+const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY || "";
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
+  if (req.header("x-admin-key") !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "bad admin key" });
+  next();
+}
+
+function requireInventoryKey(req, res, next) {
+  if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
+  if (req.header("x-inventory-key") !== INVENTORY_API_KEY) return res.status(401).json({ ok: false, error: "bad inventory key" });
+  next();
+}
+
+function requireAuth(req, res, next) {
+  const auth = req.header("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token) return res.status(401).json({ ok: false, error: "missing token" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "invalid token" });
+  }
+}
+
+// --- inventory delta helpers
+function countFromSnapshot(snapshot) {
+  const counts = {};
+  const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
+  for (const p of pets) {
+    const k = String(p?.name || p?.id || "unknown_pet");
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const food = Array.isArray(snapshot?.food) ? snapshot.food : [];
+  for (const f of food) {
+    const k = String(f?.name || f?.id || "unknown_food");
+    const qty = Number(f?.quantity || 1);
+    counts[k] = (counts[k] || 0) + qty;
+  }
+  return counts;
+}
+function deltaCounts(prevCounts, newCounts) {
+  const delta = {};
+  const keys = new Set([...Object.keys(prevCounts), ...Object.keys(newCounts)]);
+  for (const k of keys) {
+    const d = (newCounts[k] || 0) - (prevCounts[k] || 0);
+    if (d > 0) delta[k] = d;
+  }
+  return delta;
+}
+function satisfies(delta, expected) {
+  for (const [k, need] of Object.entries(expected || {})) {
+    if ((delta[k] || 0) < Number(need)) return false;
+  }
+  return true;
+}
 
 async function initDb() {
   await pool.query(`
     create table if not exists users (
       id bigserial primary key,
-      username text not null,
-      token text not null unique,
+      email text not null unique,
+      password_hash text not null,
       balance_int bigint not null default 0,
       created_at timestamptz not null default now()
+    );
+
+    create table if not exists settings (
+      key text primary key,
+      value text not null
     );
 
     create table if not exists products (
       id bigserial primary key,
       code text not null unique,
       title text not null,
-      price_int bigint not null,
-      stock_int bigint not null default 0,
-      image_url text,
-      meta jsonb not null default '{}'::jsonb
+      kind text not null default 'account', -- account, other
+      age_pots int not null default 0,
+      bucks int not null default 0,
+      price_int bigint not null default 0,
+      stock_int int not null default 1,
+      note text not null default '',
+      sold boolean not null default false,
+      sold_at timestamptz,
+      purchases_count int not null default 0,
+      created_at timestamptz not null default now()
     );
 
     create table if not exists orders (
@@ -55,13 +123,29 @@ async function initDb() {
       created_at timestamptz not null default now()
     );
 
+    create table if not exists order_items (
+      id bigserial primary key,
+      order_id bigint references orders(id),
+      product_code text not null,
+      qty int not null default 1
+    );
+
+    create table if not exists payment_slots (
+      slot int primary key, -- 1..15
+      title text not null default '',
+      item_key text not null default '', -- e.g. ride_potion or santa_dog
+      points_per_unit int not null default 0,
+      image_url text,
+      enabled boolean not null default false
+    );
+
     create table if not exists expected_payments (
       id bigserial primary key,
       user_id bigint references users(id),
-      order_id bigint references orders(id),
-      pay_type text not null,            -- ride_potion, pets, etc
-      expected jsonb not null,           -- {"ride_potion":2}
-      receiver_account text not null,    -- which farm account inventory we're watching
+      type text not null,                  -- slot / manual
+      expected jsonb not null,             -- {"ride_potion":2}
+      points_to_credit bigint not null,    -- total points to credit when matched
+      receiver_account text not null,
       status text not null default 'pending', -- pending, matched, expired
       created_at timestamptz not null default now()
     );
@@ -74,252 +158,268 @@ async function initDb() {
     );
   `);
 
-  // Seed example products if empty
-  const { rows } = await pool.query(`select count(*)::int as c from products;`);
-  if (rows[0].c === 0) {
+  // default setting: rate_agepots_per_token = 80
+  await pool.query(`
+    insert into settings (key,value)
+    values ('rate_agepots_per_token','80')
+    on conflict (key) do nothing;
+  `);
+
+  // seed 15 empty slots if not present
+  for (let i = 1; i <= 15; i++) {
     await pool.query(
-      `insert into products (code,title,price_int,stock_int,image_url,meta)
-       values
-       ('ACC_A','Account A (Anonymous)', 200, 3, null, '{"type":"account"}'),
-       ('ACC_B','Account B (Anonymous)', 350, 2, null, '{"type":"account"}'),
-       ('CREDITS_100','100 Credits', 100, 9999, null, '{"type":"credits"}')
-      `
+      `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
+      [i]
     );
   }
 }
 
-function requireUser(req, res, next) {
-  const token = req.header("x-user-token");
-  if (!token) return res.status(401).json({ ok: false, error: "Missing x-user-token" });
-  req.userToken = token;
-  next();
+// --- pricing helper (based on rate)
+async function computePriceFromRate(agePots) {
+  const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
+  const rate = Math.max(1, Number(r.rows[0]?.value || 80));
+  return Math.ceil(Number(agePots || 0) / rate);
 }
 
-function requireInventoryKey(req, res, next) {
-  const key = req.header("x-inventory-key");
-  if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "Server missing INVENTORY_API_KEY" });
-  if (key !== INVENTORY_API_KEY) return res.status(401).json({ ok: false, error: "Bad inventory key" });
-  next();
-}
+// ----------------- ROUTES -----------------
+app.get("/", (req, res) => res.send("API running ✅"));
 
-// Utility: count items in snapshot for delta check
-function countFromSnapshot(snapshot) {
-  // Snapshot is whatever you send. We'll support:
-  // { user, pets:[{name}], food:[{name,quantity}], timestamp }
-  // We'll compute counts by name for pets and food.
-  const counts = {};
-  const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
-  for (const p of pets) {
-    const name = p?.name || "unknown_pet";
-    counts[name] = (counts[name] || 0) + 1;
+/** AUTH */
+app.post("/api/auth/register", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  if (!email.includes("@") || password.length < 6) {
+    return res.status(400).json({ ok: false, error: "bad email or password too short" });
   }
-  const food = Array.isArray(snapshot?.food) ? snapshot.food : [];
-  for (const f of food) {
-    const name = f?.name || "unknown_food";
-    const qty = Number(f?.quantity || 1);
-    counts[name] = (counts[name] || 0) + qty;
+  const hash = await bcrypt.hash(password, 10);
+  try {
+    const ins = await pool.query(
+      `insert into users (email,password_hash) values ($1,$2) returning id,email,balance_int`,
+      [email, hash]
+    );
+    const token = jwt.sign({ id: ins.rows[0].id, email }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ ok: true, token, user: ins.rows[0] });
+  } catch {
+    res.status(400).json({ ok: false, error: "email already used" });
   }
-  return counts;
-}
-
-function deltaCounts(prevCounts, newCounts) {
-  const delta = {};
-  const keys = new Set([...Object.keys(prevCounts), ...Object.keys(newCounts)]);
-  for (const k of keys) {
-    const d = (newCounts[k] || 0) - (prevCounts[k] || 0);
-    if (d > 0) delta[k] = d;
-  }
-  return delta;
-}
-
-function satisfies(delta, expected) {
-  // expected: {"ride_potion":2} etc
-  for (const [k, need] of Object.entries(expected || {})) {
-    if ((delta[k] || 0) < Number(need)) return false;
-  }
-  return true;
-}
-
-// ------------------- PUBLIC PAGES -------------------
-app.get("/", async (req, res) => {
-  res.send(`
-  <h1>AdoptMeHub API is running</h1>
-  <p>Try <a href="/shop">/shop</a></p>
-  `);
 });
 
-app.get("/shop", async (req, res) => {
-  const { rows } = await pool.query(`select id,code,title,price_int,stock_int,image_url from products order by id asc;`);
-  const cards = rows.map(p => `
-    <div style="border:1px solid #333;padding:12px;border-radius:10px;margin:10px;max-width:420px">
-      <div style="font-weight:700">${p.title}</div>
-      <div style="opacity:.8">Code: ${p.code}</div>
-      <div>Price: <b>${p.price_int}</b> credits</div>
-      <div>Stock: <b>${p.stock_int}</b></div>
-    </div>
-  `).join("");
-
-  res.send(`
-  <html><body style="background:#111;color:#fff;font-family:Arial;padding:24px">
-    <h1>Shop (v1)</h1>
-    <p>This is a basic preview. The real UI comes next.</p>
-    ${cards}
-    <hr style="opacity:.2"/>
-    <p><b>API:</b> GET /api/products</p>
-  </body></html>
-  `);
+app.post("/api/auth/login", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const u = await pool.query(`select id,email,password_hash,balance_int from users where email=$1`, [email]);
+  if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad login" });
+  const ok = await bcrypt.compare(password, u.rows[0].password_hash);
+  if (!ok) return res.status(401).json({ ok: false, error: "bad login" });
+  const token = jwt.sign({ id: u.rows[0].id, email }, JWT_SECRET, { expiresIn: "30d" });
+  res.json({ ok: true, token, user: { id: u.rows[0].id, email: u.rows[0].email, balance_int: u.rows[0].balance_int } });
 });
 
-// ------------------- AUTH (simple token) -------------------
-app.post("/api/register", async (req, res) => {
-  const username = String(req.body?.username || "").trim();
-  if (!username) return res.status(400).json({ ok: false, error: "username required" });
+app.get("/api/me", requireAuth, async (req, res) => {
+  const u = await pool.query(`select id,email,balance_int from users where id=$1`, [req.user.id]);
+  res.json({ ok: true, me: u.rows[0] });
+});
 
-  const token = crypto.randomBytes(24).toString("hex");
-  const { rows } = await pool.query(
-    `insert into users (username, token) values ($1,$2) returning id, username, token, balance_int;`,
-    [username, token]
+/** SETTINGS (rates) */
+app.get("/api/settings", async (req, res) => {
+  const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
+  res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 80) });
+});
+app.post("/api/admin/settings", requireAdmin, async (req, res) => {
+  const rate = Math.max(1, Number(req.body?.rate_agepots_per_token || 80));
+  await pool.query(
+    `insert into settings(key,value) values('rate_agepots_per_token',$1)
+     on conflict(key) do update set value=excluded.value`,
+    [String(rate)]
   );
-  res.json({ ok: true, user: rows[0] });
+  res.json({ ok: true, rate });
 });
 
-app.get("/api/me", requireUser, async (req, res) => {
-  const { rows } = await pool.query(`select id,username,balance_int from users where token=$1`, [req.userToken]);
-  if (!rows[0]) return res.status(401).json({ ok: false, error: "bad token" });
-  res.json({ ok: true, me: rows[0] });
-});
-
-// ------------------- SHOP API -------------------
+/** PRODUCTS (accounts) */
 app.get("/api/products", async (req, res) => {
-  const { rows } = await pool.query(`select id,code,title,price_int,stock_int,image_url,meta from products order by id asc;`);
-  res.json({ ok: true, products: rows });
+  const rows = await pool.query(`
+    select id,code,title,kind,age_pots,bucks,price_int,stock_int,note,sold,purchases_count
+    from products
+    order by created_at desc
+  `);
+  res.json({ ok: true, products: rows.rows });
 });
 
-app.post("/api/orders/create", requireUser, async (req, res) => {
-  const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
-  if (cart.length === 0) return res.status(400).json({ ok: false, error: "cart is empty" });
+app.post("/api/admin/products/add", requireAdmin, async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  const title = String(req.body?.title || "").trim();
+  const age_pots = Number(req.body?.age_pots || 0);
+  const bucks = Number(req.body?.bucks || 0);
+  const note = String(req.body?.note || "").trim();
 
-  // cart items: [{code:"ACC_A", qty:1}]
-  const codes = cart.map(i => String(i.code || ""));
-  const { rows: prods } = await pool.query(
-    `select code, price_int, stock_int from products where code = any($1::text[])`,
-    [codes]
+  if (!code || !title) return res.status(400).json({ ok: false, error: "code + title required" });
+
+  const price_int = await computePriceFromRate(age_pots);
+
+  await pool.query(
+    `insert into products (code,title,kind,age_pots,bucks,price_int,stock_int,note)
+     values ($1,$2,'account',$3,$4,$5,1,$6)`,
+    [code, title, age_pots, bucks, price_int, note]
   );
+  res.json({ ok: true });
+});
 
-  const map = new Map(prods.map(p => [p.code, p]));
+app.post("/api/admin/products/mark-sold", requireAdmin, async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  const p = await pool.query(`select note from products where code=$1`, [code]);
+  if (!p.rows[0]) return res.status(404).json({ ok: false, error: "not found" });
+
+  const note = p.rows[0].note.includes("--sold") ? p.rows[0].note : (p.rows[0].note ? `${p.rows[0].note} --sold` : "--sold");
+
+  await pool.query(
+    `update products set sold=true, stock_int=0, sold_at=now(), note=$2 where code=$1`,
+    [code, note]
+  );
+  res.json({ ok: true });
+});
+
+/** ORDERS */
+app.post("/api/orders/create", requireAuth, async (req, res) => {
+  const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
+  if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
+
+  const codes = cart.map(i => String(i.code || ""));
+  const prods = await pool.query(`select code,price_int,stock_int,sold from products where code = any($1::text[])`, [codes]);
+  const map = new Map(prods.rows.map(p => [p.code, p]));
+
   let total = 0;
   for (const item of cart) {
     const code = String(item.code || "");
     const qty = Math.max(1, Number(item.qty || 1));
     const p = map.get(code);
-    if (!p) return res.status(400).json({ ok: false, error: `unknown product ${code}` });
-    if (p.stock_int < qty) return res.status(400).json({ ok: false, error: `out of stock: ${code}` });
-    total += p.price_int * qty;
+    if (!p) return res.status(400).json({ ok: false, error: `unknown ${code}` });
+    if (p.sold || p.stock_int < qty) return res.status(400).json({ ok: false, error: `out of stock: ${code}` });
+    total += Number(p.price_int) * qty;
   }
 
-  const u = await pool.query(`select id from users where token=$1`, [req.userToken]);
-  if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad token" });
-
   const created = await pool.query(
-    `insert into orders (user_id, cart, total_int) values ($1,$2,$3) returning id,status,total_int;`,
-    [u.rows[0].id, JSON.stringify(cart), total]
+    `insert into orders (user_id, cart, total_int) values ($1,$2,$3) returning id,status,total_int`,
+    [req.user.id, JSON.stringify(cart), total]
   );
+
+  // store items
+  for (const item of cart) {
+    await pool.query(`insert into order_items(order_id,product_code,qty) values ($1,$2,$3)`, [
+      created.rows[0].id, String(item.code), Math.max(1, Number(item.qty || 1))
+    ]);
+  }
 
   res.json({ ok: true, order: created.rows[0] });
 });
 
-// Create an expected payment for an order (what you described)
-app.post("/api/payments/expect", requireUser, async (req, res) => {
-  const orderId = Number(req.body?.order_id);
-  const payType = String(req.body?.pay_type || "").trim(); // ride_potion, pets, etc
-  const expected = req.body?.expected; // {"ride_potion":2}
-  const receiverAccount = String(req.body?.receiver_account || "").trim(); // e.g. "FarmAccount2"
-
-  if (!orderId || !payType || !receiverAccount || typeof expected !== "object") {
-    return res.status(400).json({ ok: false, error: "order_id, pay_type, expected{}, receiver_account required" });
-  }
-
-  const u = await pool.query(`select id from users where token=$1`, [req.userToken]);
-  if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad token" });
-
-  const ord = await pool.query(`select id,status from orders where id=$1 and user_id=$2`, [orderId, u.rows[0].id]);
-  if (!ord.rows[0]) return res.status(404).json({ ok: false, error: "order not found" });
-
-  const created = await pool.query(
-    `insert into expected_payments (user_id, order_id, pay_type, expected, receiver_account)
-     values ($1,$2,$3,$4,$5)
-     returning id,status;`,
-    [u.rows[0].id, orderId, payType, JSON.stringify(expected), receiverAccount]
-  );
-
-  res.json({ ok: true, expected_payment: created.rows[0] });
+/** Payment slots (15 configurable) */
+app.get("/api/payment-slots", async (req, res) => {
+  const rows = await pool.query(`select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`);
+  res.json({ ok: true, slots: rows.rows });
 });
 
-// ------------------- INVENTORY INGEST (SECURED) -------------------
-// Your Roblox/executor posts here with x-inventory-key
+app.post("/api/admin/payment-slots/set", requireAdmin, async (req, res) => {
+  const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
+  const title = String(req.body?.title || "");
+  const item_key = String(req.body?.item_key || "");
+  const points_per_unit = Math.max(0, Number(req.body?.points_per_unit || 0));
+  const image_url = req.body?.image_url ? String(req.body.image_url) : null;
+  const enabled = Boolean(req.body?.enabled);
+
+  await pool.query(
+    `update payment_slots
+     set title=$2,item_key=$3,points_per_unit=$4,image_url=$5,enabled=$6
+     where slot=$1`,
+    [slot, title, item_key, points_per_unit, image_url, enabled]
+  );
+  res.json({ ok: true });
+});
+
+/** Create expected payment from a slot selection */
+app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
+  const receiver_account = String(req.body?.receiver_account || "").trim();
+  const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
+  const qty = Math.max(1, Number(req.body?.qty || 1));
+
+  if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
+
+  const s = await pool.query(`select enabled,item_key,points_per_unit from payment_slots where slot=$1`, [slot]);
+  if (!s.rows[0] || !s.rows[0].enabled) return res.status(400).json({ ok: false, error: "slot disabled" });
+
+  const item_key = s.rows[0].item_key;
+  const points = Number(s.rows[0].points_per_unit) * qty;
+
+  const expected = {};
+  expected[item_key] = qty;
+
+  const ins = await pool.query(
+    `insert into expected_payments (user_id,type,expected,points_to_credit,receiver_account)
+     values ($1,'slot',$2,$3,$4) returning id,status`,
+    [req.user.id, JSON.stringify(expected), points, receiver_account]
+  );
+
+  res.json({ ok: true, expected_payment: ins.rows[0], expected, points });
+});
+
+/** Inventory ingest: match deltas to expected payments and credit balance */
 app.post("/inventory", requireInventoryKey, async (req, res) => {
-  const receiver_account = String(req.body?.user || "unknown"); // using your payload.user as receiver account id
+  const receiver_account = String(req.body?.user || "unknown"); // your sender sets payload.user
   const snapshot = req.body;
 
-  // get last snapshot for delta
   const last = await pool.query(
     `select data from inventory_snapshots where receiver_account=$1 order by id desc limit 1`,
     [receiver_account]
   );
 
-  const prevData = last.rows[0]?.data || null;
-  const prevCounts = prevData ? countFromSnapshot(prevData) : {};
-  const newCounts = countFromSnapshot(snapshot);
-  const delta = deltaCounts(prevCounts, newCounts);
+  const prev = last.rows[0]?.data || null;
+  const delta = deltaCounts(prev ? countFromSnapshot(prev) : {}, countFromSnapshot(snapshot));
 
-  // store snapshot
-  await pool.query(
-    `insert into inventory_snapshots (receiver_account, data) values ($1,$2)`,
-    [receiver_account, JSON.stringify(snapshot)]
-  );
+  await pool.query(`insert into inventory_snapshots (receiver_account,data) values ($1,$2)`, [
+    receiver_account, JSON.stringify(snapshot)
+  ]);
 
-  // try match pending expected payments for this receiver account
   const pending = await pool.query(
-    `select id,user_id,order_id,expected from expected_payments
+    `select id,user_id,expected,points_to_credit
+     from expected_payments
      where receiver_account=$1 and status='pending'
      order by id asc`,
     [receiver_account]
   );
 
-  let matched = [];
+  const matched = [];
   for (const p of pending.rows) {
-    const expected = p.expected;
-    if (satisfies(delta, expected)) {
-      // mark matched + credit user balance by order total (or however you want)
+    if (satisfies(delta, p.expected)) {
       await pool.query(`update expected_payments set status='matched' where id=$1`, [p.id]);
-
-      const order = await pool.query(`select total_int from orders where id=$1`, [p.order_id]);
-      const amount = order.rows[0]?.total_int || 0;
-
-      await pool.query(`update users set balance_int = balance_int + $1 where id=$2`, [amount, p.user_id]);
-      await pool.query(`update orders set status='paid' where id=$1`, [p.order_id]);
-
-      matched.push({ expected_payment_id: p.id, credited: amount });
+      await pool.query(`update users set balance_int = balance_int + $1 where id=$2`, [Number(p.points_to_credit), p.user_id]);
+      matched.push({ expected_payment_id: p.id, credited: Number(p.points_to_credit) });
     }
   }
 
   res.json({ ok: true, delta, matched });
 });
 
-// View latest inventory (public for now)
-app.get("/inventory/latest/:receiver_account", async (req, res) => {
-  const receiver = req.params.receiver_account;
-  const { rows } = await pool.query(
-    `select received_at,data from inventory_snapshots where receiver_account=$1 order by id desc limit 1`,
-    [receiver]
+/** Leaderboard: most bought accounts */
+app.get("/api/leaderboard", async (req, res) => {
+  const rows = await pool.query(`
+    select product_code, sum(qty)::int as buys
+    from order_items
+    group by product_code
+    order by buys desc
+    limit 20
+  `);
+  res.json({ ok: true, leaderboard: rows.rows });
+});
+
+/** My purchased accounts */
+app.get("/api/my-accounts", requireAuth, async (req, res) => {
+  const rows = await pool.query(
+    `select id,status,cart,total_int,created_at from orders where user_id=$1 order by id desc`,
+    [req.user.id]
   );
-  res.json({ ok: true, latest: rows[0] || null });
+  res.json({ ok: true, orders: rows.rows });
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => console.log("✅ listening on", PORT));
 
-initDb().catch((e) => {
-  console.error("DB init failed (server still running):", e);
-});
+initDb().catch(e => console.error("DB init error:", e));
