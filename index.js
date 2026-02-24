@@ -11,17 +11,18 @@ app.use((req, res, next) => {
   const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
   const origin = req.headers.origin;
   if (origin && allowed.has(origin)) res.setHeader("Access-Control-Allow-Origin", origin);
+
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
+// ✅ FIX: Always use DATABASE_URL + SSL for managed Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("railway")
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
@@ -184,6 +185,7 @@ async function computePriceFromRate(agePots) {
 
 // ----------------- ROUTES -----------------
 app.get("/", (req, res) => res.send("API running ✅"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 /** AUTH */
 app.post("/api/auth/register", async (req, res) => {
@@ -270,7 +272,9 @@ app.post("/api/admin/products/mark-sold", requireAdmin, async (req, res) => {
   const p = await pool.query(`select note from products where code=$1`, [code]);
   if (!p.rows[0]) return res.status(404).json({ ok: false, error: "not found" });
 
-  const note = p.rows[0].note.includes("--sold") ? p.rows[0].note : (p.rows[0].note ? `${p.rows[0].note} --sold` : "--sold");
+  const note = p.rows[0].note.includes("--sold")
+    ? p.rows[0].note
+    : (p.rows[0].note ? `${p.rows[0].note} --sold` : "--sold");
 
   await pool.query(
     `update products set sold=true, stock_int=0, sold_at=now(), note=$2 where code=$1`,
@@ -285,7 +289,10 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
 
   const codes = cart.map(i => String(i.code || ""));
-  const prods = await pool.query(`select code,price_int,stock_int,sold from products where code = any($1::text[])`, [codes]);
+  const prods = await pool.query(
+    `select code,price_int,stock_int,sold from products where code = any($1::text[])`,
+    [codes]
+  );
   const map = new Map(prods.rows.map(p => [p.code, p]));
 
   let total = 0;
@@ -303,19 +310,21 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
     [req.user.id, JSON.stringify(cart), total]
   );
 
-  // store items
   for (const item of cart) {
-    await pool.query(`insert into order_items(order_id,product_code,qty) values ($1,$2,$3)`, [
-      created.rows[0].id, String(item.code), Math.max(1, Number(item.qty || 1))
-    ]);
+    await pool.query(
+      `insert into order_items(order_id,product_code,qty) values ($1,$2,$3)`,
+      [created.rows[0].id, String(item.code), Math.max(1, Number(item.qty || 1))]
+    );
   }
 
   res.json({ ok: true, order: created.rows[0] });
 });
 
-/** Payment slots (15 configurable) */
+/** Payment slots */
 app.get("/api/payment-slots", async (req, res) => {
-  const rows = await pool.query(`select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`);
+  const rows = await pool.query(
+    `select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`
+  );
   res.json({ ok: true, slots: rows.rows });
 });
 
@@ -336,7 +345,6 @@ app.post("/api/admin/payment-slots/set", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-/** Create expected payment from a slot selection */
 app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
@@ -362,9 +370,9 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   res.json({ ok: true, expected_payment: ins.rows[0], expected, points });
 });
 
-/** Inventory ingest: match deltas to expected payments and credit balance */
+/** Inventory ingest */
 app.post("/inventory", requireInventoryKey, async (req, res) => {
-  const receiver_account = String(req.body?.user || "unknown"); // your sender sets payload.user
+  const receiver_account = String(req.body?.user || "unknown");
   const snapshot = req.body;
 
   const last = await pool.query(
@@ -399,7 +407,7 @@ app.post("/inventory", requireInventoryKey, async (req, res) => {
   res.json({ ok: true, delta, matched });
 });
 
-/** Leaderboard: most bought accounts */
+/** Leaderboard */
 app.get("/api/leaderboard", async (req, res) => {
   const rows = await pool.query(`
     select product_code, sum(qty)::int as buys
@@ -411,7 +419,7 @@ app.get("/api/leaderboard", async (req, res) => {
   res.json({ ok: true, leaderboard: rows.rows });
 });
 
-/** My purchased accounts */
+/** My orders */
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
   const rows = await pool.query(
     `select id,status,cart,total_int,created_at from orders where user_id=$1 order by id desc`,
@@ -420,11 +428,11 @@ app.get("/api/my-accounts", requireAuth, async (req, res) => {
   res.json({ ok: true, orders: rows.rows });
 });
 
+// ✅ FIX: bind to 0.0.0.0 + use Railway PORT
 const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => console.log("✅ listening on", PORT));
 
-app.get("/", (req, res) => res.send("API running ✅"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ listening on", PORT);
-});
+// ✅ FIX: DB init cannot kill the server
+initDb()
+  .then(() => console.log("✅ DB ready"))
+  .catch((e) => console.error("❌ DB init error (server still running):", e?.message || e));
