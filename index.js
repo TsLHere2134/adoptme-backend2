@@ -1,5 +1,5 @@
 import express from "express";
-import pg from "pg";
+import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
