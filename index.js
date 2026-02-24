@@ -5,6 +5,18 @@ import pg from "pg";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
+app.use((req, res, next) => {
+  const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
+  const origin = req.headers.origin;
+  if (origin && allowed.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-user-token");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 const { Pool } = pg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
