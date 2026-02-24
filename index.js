@@ -185,6 +185,11 @@ async function computePriceFromRate(agePots) {
 
 // ----------------- ROUTES -----------------
 app.get("/", (req, res) => res.send("API running ✅"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+app.use((req, res, next) => {
+  console.log(req.method, req.url);
+  next();
+});
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 /** AUTH */
@@ -429,8 +434,16 @@ app.get("/api/my-accounts", requireAuth, async (req, res) => {
 });
 
 // ✅ FIX: bind to 0.0.0.0 + use Railway PORT
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log("✅ listening on", PORT));
+const PORT = Number(process.env.PORT || 3000);
+
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log("✅ listening on", PORT);
+});
+
+process.on("SIGTERM", () => {
+  console.log("⚠️ SIGTERM received — shutting down");
+  server.close(() => process.exit(0));
+});
 
 // ✅ FIX: DB init cannot kill the server
 initDb()
