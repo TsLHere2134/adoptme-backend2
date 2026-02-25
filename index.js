@@ -108,7 +108,7 @@ function satisfies(delta, expected) {
 }
 
 async function initDb() {
-  // Create tables (fresh installs)
+  // Create base tables (won't overwrite existing)
   await pool.query(`
     create table if not exists users (
       id bigserial primary key,
@@ -185,6 +185,54 @@ async function initDb() {
       data jsonb not null
     );
   `);
+
+  // Add discord columns if missing (safe)
+  await pool.query(`alter table users add column if not exists discord_id text;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists discord_username text;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists discord_avatar text;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists balance_int bigint not null default 0;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists created_at timestamptz not null default now();`).catch(() => {});
+
+  // ✅ Only alter email/password if they exist
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='users' AND column_name='email'
+      ) THEN
+        EXECUTE 'ALTER TABLE users ALTER COLUMN email DROP NOT NULL';
+      END IF;
+
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name='users' AND column_name='password_hash'
+      ) THEN
+        EXECUTE 'ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL';
+      END IF;
+    END $$;
+  `).catch(() => {});
+
+  // Unique index for discord_id (partial so null allowed)
+  await pool.query(
+    `create unique index if not exists users_discord_id_uidx on users(discord_id) where discord_id is not null;`
+  ).catch(() => {});
+
+  // Default setting
+  await pool.query(`
+    insert into settings (key,value)
+    values ('rate_agepots_per_token','80')
+    on conflict (key) do nothing;
+  `);
+
+  // Seed payment slots
+  for (let i = 1; i <= 15; i++) {
+    await pool.query(
+      `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
+      [i]
+    );
+  }
+}
 
   // --- migrate older installs safely (if your old users table had NOT NULL)
   await pool.query(`alter table users add column if not exists discord_id text;`).catch(() => {});
