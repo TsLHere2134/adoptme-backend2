@@ -1,7 +1,7 @@
 import express from "express";
 import { Pool } from "pg";
-import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -43,6 +43,13 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY || "";
 
+// Discord OAuth env
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_REDIRECT_URI =
+  process.env.DISCORD_REDIRECT_URI || "https://api.adoptmehub.com/api/auth/discord/callback";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://adoptmehub.com";
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
   if (req.header("x-admin-key") !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "bad admin key" });
@@ -51,7 +58,8 @@ function requireAdmin(req, res, next) {
 
 function requireInventoryKey(req, res, next) {
   if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
-  if (req.header("x-inventory-key") !== INVENTORY_API_KEY) return res.status(401).json({ ok: false, error: "bad inventory key" });
+  if (req.header("x-inventory-key") !== INVENTORY_API_KEY)
+    return res.status(401).json({ ok: false, error: "bad inventory key" });
   next();
 }
 
@@ -100,11 +108,15 @@ function satisfies(delta, expected) {
 }
 
 async function initDb() {
+  // Create tables (fresh installs)
   await pool.query(`
     create table if not exists users (
       id bigserial primary key,
-      email text not null unique,
-      password_hash text not null,
+      email text unique,
+      password_hash text,
+      discord_id text,
+      discord_username text,
+      discord_avatar text,
       balance_int bigint not null default 0,
       created_at timestamptz not null default now()
     );
@@ -174,12 +186,28 @@ async function initDb() {
     );
   `);
 
+  // --- migrate older installs safely (if your old users table had NOT NULL)
+  await pool.query(`alter table users add column if not exists discord_id text;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists discord_username text;`).catch(() => {});
+  await pool.query(`alter table users add column if not exists discord_avatar text;`).catch(() => {});
+
+  // Drop NOT NULL if they existed previously
+  await pool.query(`alter table users alter column email drop not null;`).catch(() => {});
+  await pool.query(`alter table users alter column password_hash drop not null;`).catch(() => {});
+
+  // Unique index for discord_id (partial so nulls allowed)
+  await pool.query(
+    `create unique index if not exists users_discord_id_uidx on users(discord_id) where discord_id is not null;`
+  ).catch(() => {});
+
+  // default setting: rate_agepots_per_token = 80
   await pool.query(`
     insert into settings (key,value)
     values ('rate_agepots_per_token','80')
     on conflict (key) do nothing;
   `);
 
+  // seed 15 empty slots if not present
   for (let i = 1; i <= 15; i++) {
     await pool.query(
       `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
@@ -195,39 +223,114 @@ async function computePriceFromRate(agePots) {
   return Math.ceil(Number(agePots || 0) / rate);
 }
 
-// ----------------- AUTH -----------------
-app.post("/api/auth/register", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-  if (!email.includes("@") || password.length < 6) {
-    return res.status(400).json({ ok: false, error: "bad email or password too short" });
+// ----------------- DISCORD AUTH -----------------
+
+function base64url(buf) {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+app.get("/api/auth/discord", (req, res) => {
+  if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
+    return res.status(500).send("Discord OAuth not configured");
   }
-  const hash = await bcrypt.hash(password, 10);
+
+  const state = base64url(crypto.randomBytes(24));
+
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    redirect_uri: DISCORD_REDIRECT_URI,
+    response_type: "code",
+    scope: "identify",
+    state,
+    prompt: "consent",
+  });
+
+  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+});
+
+app.get("/api/auth/discord/callback", async (req, res) => {
   try {
-    const ins = await pool.query(
-      `insert into users (email,password_hash) values ($1,$2) returning id,email,balance_int`,
-      [email, hash]
+    const code = String(req.query.code || "");
+    if (!code) return res.status(400).send("Missing code");
+
+    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
+      return res.status(500).send("Discord OAuth not configured");
+    }
+
+    // Exchange code -> access token
+    const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: DISCORD_REDIRECT_URI,
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      const txt = await tokenRes.text();
+      return res.status(400).send("Token exchange failed: " + txt);
+    }
+
+    const tokenJson = await tokenRes.json();
+
+    // Fetch Discord user profile
+    const userRes = await fetch("https://discord.com/api/users/@me", {
+      headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+    });
+
+    if (!userRes.ok) {
+      const txt = await userRes.text();
+      return res.status(400).send("User fetch failed: " + txt);
+    }
+
+    const d = await userRes.json();
+    const discord_id = String(d.id);
+    const discord_username =
+      `${d.username}` + (d.discriminator && d.discriminator !== "0" ? `#${d.discriminator}` : "");
+    const discord_avatar = d.avatar ? `https://cdn.discordapp.com/avatars/${d.id}/${d.avatar}.png` : null;
+
+    // Upsert user by discord_id
+    const up = await pool.query(
+      `
+      insert into users (discord_id, discord_username, discord_avatar)
+      values ($1,$2,$3)
+      on conflict (discord_id) do update
+        set discord_username = excluded.discord_username,
+            discord_avatar = excluded.discord_avatar
+      returning id, discord_id, discord_username, discord_avatar, balance_int
+      `,
+      [discord_id, discord_username, discord_avatar]
     );
-    const token = jwt.sign({ id: ins.rows[0].id, email }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ ok: true, token, user: ins.rows[0] });
-  } catch {
-    res.status(400).json({ ok: false, error: "email already used" });
+
+    const userRow = up.rows[0];
+
+    // Issue your JWT
+    const jwtToken = jwt.sign(
+      { id: userRow.id, discord_id: userRow.discord_id },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    // Redirect back to your website with token in hash
+    // Website reads: window.location.hash => "#token=..."
+    res.redirect(`${FRONTEND_URL}/#token=${encodeURIComponent(jwtToken)}`);
+  } catch (e) {
+    console.error("Discord callback error:", e);
+    res.status(500).send("Discord login failed");
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
-  const password = String(req.body?.password || "");
-  const u = await pool.query(`select id,email,password_hash,balance_int from users where email=$1`, [email]);
-  if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad login" });
-  const ok = await bcrypt.compare(password, u.rows[0].password_hash);
-  if (!ok) return res.status(401).json({ ok: false, error: "bad login" });
-  const token = jwt.sign({ id: u.rows[0].id, email }, JWT_SECRET, { expiresIn: "30d" });
-  res.json({ ok: true, token, user: { id: u.rows[0].id, email: u.rows[0].email, balance_int: u.rows[0].balance_int } });
-});
-
+// ----------------- ME -----------------
 app.get("/api/me", requireAuth, async (req, res) => {
-  const u = await pool.query(`select id,email,balance_int from users where id=$1`, [req.user.id]);
+  const u = await pool.query(
+    `select id, discord_id, discord_username, discord_avatar, balance_int, created_at
+     from users where id=$1`,
+    [req.user.id]
+  );
   res.json({ ok: true, me: u.rows[0] });
 });
 
@@ -264,7 +367,9 @@ app.post("/api/admin/products/add", requireAdmin, async (req, res) => {
   const bucks = Number(req.body?.bucks || 0);
   const note = String(req.body?.note || "").trim();
   if (!code || !title) return res.status(400).json({ ok: false, error: "code + title required" });
+
   const price_int = await computePriceFromRate(age_pots);
+
   await pool.query(
     `insert into products (code,title,kind,age_pots,bucks,price_int,stock_int,note)
      values ($1,$2,'account',$3,$4,$5,1,$6)`,
