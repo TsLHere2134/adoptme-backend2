@@ -1,50 +1,17 @@
 import express from "express";
 import { Pool } from "pg";
 import jwt from "jsonwebtoken";
-import crypto from "crypto";
+import bcrypt from "bcryptjs";
 
 const app = express();
 
-// ✅ Health routes FIRST (so Railway always gets a fast 200)
-app.get("/health", (req, res) => res.status(200).send("ok"));
+// ✅ Health FIRST (Railway loves this)
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 app.get("/", (req, res) => res.status(200).send("API running ✅"));
-
-app.get("/debug/env", (req, res) => {
-  res.json({
-    ok: true,
-    hasClientId: Boolean(process.env.DISCORD_CLIENT_ID),
-    hasClientSecret: Boolean(process.env.DISCORD_CLIENT_SECRET),
-    redirectUri: process.env.DISCORD_REDIRECT_URI || null,
-    frontendUrl: process.env.FRONTEND_URL || null
-  });
-});
-
-app.get("/api/auth/discord", (req, res) => {
-  try {
-    if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
-      return res.status(500).send("Discord OAuth not configured (missing env vars)");
-    }
-
-    const state = base64url(crypto.randomBytes(24));
-    const params = new URLSearchParams({
-      client_id: DISCORD_CLIENT_ID,
-      redirect_uri: DISCORD_REDIRECT_URI,
-      response_type: "code",
-      scope: "identify",
-      state,
-      prompt: "consent",
-    });
-
-    return res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
-  } catch (e) {
-    console.error("discord redirect error:", e);
-    return res.status(500).send("discord redirect error");
-  }
-});
 
 app.use(express.json({ limit: "5mb" }));
 
-// --- CORS (website can call API)
+// --- CORS
 app.use((req, res, next) => {
   const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
   const origin = req.headers.origin;
@@ -64,13 +31,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- request logger (after health!)
+// --- Logger (after /health)
 app.use((req, res, next) => {
   console.log("REQ", req.method, req.url);
   next();
 });
 
-// ✅ Postgres pool
+// ✅ Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
@@ -80,23 +47,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY || "";
 
-// Discord OAuth env
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "";
-const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
-const DISCORD_REDIRECT_URI =
-  process.env.DISCORD_REDIRECT_URI || "https://api.adoptmehub.com/api/auth/discord/callback";
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://adoptmehub.com";
-
+// --------- AUTH HELPERS ----------
 function requireAdmin(req, res, next) {
   if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
-  if (req.header("x-admin-key") !== ADMIN_KEY)
-    return res.status(401).json({ ok: false, error: "bad admin key" });
+  if (req.header("x-admin-key") !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "bad admin key" });
   next();
 }
 
 function requireInventoryKey(req, res, next) {
-  if (!INVENTORY_API_KEY)
-    return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
+  if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
   if (req.header("x-inventory-key") !== INVENTORY_API_KEY)
     return res.status(401).json({ ok: false, error: "bad inventory key" });
   next();
@@ -114,7 +73,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-// --- inventory delta helpers
+// --------- INVENTORY DELTA HELPERS ----------
 function countFromSnapshot(snapshot) {
   const counts = {};
   const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
@@ -146,16 +105,14 @@ function satisfies(delta, expected) {
   return true;
 }
 
+// --------- DB INIT ----------
 async function initDb() {
-  // Create base tables (won't overwrite existing)
+  // ✅ Use NEW table users_local so we don't fight your old broken users table
   await pool.query(`
-    create table if not exists users (
+    create table if not exists users_local (
       id bigserial primary key,
-      email text unique,
-      password_hash text,
-      discord_id text,
-      discord_username text,
-      discord_avatar text,
+      username text not null unique,
+      password_hash text not null,
       balance_int bigint not null default 0,
       created_at timestamptz not null default now()
     );
@@ -183,7 +140,7 @@ async function initDb() {
 
     create table if not exists orders (
       id bigserial primary key,
-      user_id bigint references users(id),
+      user_id bigint references users_local(id),
       status text not null default 'pending',
       cart jsonb not null default '[]'::jsonb,
       total_int bigint not null default 0,
@@ -208,7 +165,7 @@ async function initDb() {
 
     create table if not exists expected_payments (
       id bigserial primary key,
-      user_id bigint references users(id),
+      user_id bigint references users_local(id),
       type text not null,
       expected jsonb not null,
       points_to_credit bigint not null,
@@ -225,48 +182,12 @@ async function initDb() {
     );
   `);
 
-  // Add discord columns if missing (safe)
-  await pool.query(`alter table users add column if not exists discord_id text;`).catch(() => {});
-  await pool.query(`alter table users add column if not exists discord_username text;`).catch(() => {});
-  await pool.query(`alter table users add column if not exists discord_avatar text;`).catch(() => {});
-
-  // ✅ Only alter email/password if they exist
-  await pool
-    .query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='users' AND column_name='email'
-      ) THEN
-        EXECUTE 'ALTER TABLE users ALTER COLUMN email DROP NOT NULL';
-      END IF;
-
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='users' AND column_name='password_hash'
-      ) THEN
-        EXECUTE 'ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL';
-      END IF;
-    END $$;
-  `)
-    .catch(() => {});
-
-  // Unique index for discord_id (partial so null allowed)
-  await pool
-    .query(
-      `create unique index if not exists users_discord_id_uidx on users(discord_id) where discord_id is not null;`
-    )
-    .catch(() => {});
-
-  // Default setting
   await pool.query(`
     insert into settings (key,value)
     values ('rate_agepots_per_token','80')
     on conflict (key) do nothing;
   `);
 
-  // Seed payment slots
   for (let i = 1; i <= 15; i++) {
     await pool.query(
       `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
@@ -282,116 +203,60 @@ async function computePriceFromRate(agePots) {
   return Math.ceil(Number(agePots || 0) / rate);
 }
 
-// ----------------- DISCORD AUTH -----------------
-function base64url(buf) {
-  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
+// ================= AUTH: USERNAME + PASSWORD =================
 
-app.get("/api/auth/discord", (req, res) => {
-  if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
-    return res.status(500).send("Discord OAuth not configured");
-  }
+// Register
+app.post("/api/auth/register", async (req, res) => {
+  const username = String(req.body?.username || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
 
-  const state = base64url(crypto.randomBytes(24));
+  if (username.length < 3) return res.status(400).json({ ok: false, error: "username too short" });
+  if (password.length < 6) return res.status(400).json({ ok: false, error: "password too short (min 6)" });
 
-  const params = new URLSearchParams({
-    client_id: DISCORD_CLIENT_ID,
-    redirect_uri: DISCORD_REDIRECT_URI,
-    response_type: "code",
-    scope: "identify",
-    state,
-    prompt: "consent",
-  });
+  const hash = await bcrypt.hash(password, 10);
 
-  res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
-});
-
-app.get("/api/auth/discord/callback", async (req, res) => {
   try {
-    const code = String(req.query.code || "");
-    if (!code) return res.status(400).send("Missing code");
-
-    if (!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET || !DISCORD_REDIRECT_URI) {
-      return res.status(500).send("Discord OAuth not configured");
-    }
-
-    // Exchange code -> access token
-    const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: DISCORD_CLIENT_ID,
-        client_secret: DISCORD_CLIENT_SECRET,
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: DISCORD_REDIRECT_URI,
-      }),
-    });
-
-    if (!tokenRes.ok) {
-      const txt = await tokenRes.text();
-      return res.status(400).send("Token exchange failed: " + txt);
-    }
-
-    const tokenJson = await tokenRes.json();
-
-    // Fetch Discord user profile
-    const userRes = await fetch("https://discord.com/api/users/@me", {
-      headers: { Authorization: `Bearer ${tokenJson.access_token}` },
-    });
-
-    if (!userRes.ok) {
-      const txt = await userRes.text();
-      return res.status(400).send("User fetch failed: " + txt);
-    }
-
-    const d = await userRes.json();
-    const discord_id = String(d.id);
-    const discord_username =
-      `${d.username}` + (d.discriminator && d.discriminator !== "0" ? `#${d.discriminator}` : "");
-    const discord_avatar = d.avatar
-      ? `https://cdn.discordapp.com/avatars/${d.id}/${d.avatar}.png`
-      : null;
-
-    // Upsert user by discord_id
-    const up = await pool.query(
-      `
-      insert into users (discord_id, discord_username, discord_avatar)
-      values ($1,$2,$3)
-      on conflict (discord_id) do update
-        set discord_username = excluded.discord_username,
-            discord_avatar = excluded.discord_avatar
-      returning id, discord_id, discord_username, discord_avatar, balance_int
-      `,
-      [discord_id, discord_username, discord_avatar]
+    const ins = await pool.query(
+      `insert into users_local (username,password_hash) values ($1,$2) returning id,username,balance_int,created_at`,
+      [username, hash]
     );
 
-    const userRow = up.rows[0];
-
-    // Issue JWT
-    const jwtToken = jwt.sign({ id: userRow.id, discord_id: userRow.discord_id }, JWT_SECRET, {
-      expiresIn: "30d",
-    });
-
-    // Redirect back to site with token
-    res.redirect(`${FRONTEND_URL}/#token=${encodeURIComponent(jwtToken)}`);
-  } catch (e) {
-    console.error("Discord callback error:", e);
-    res.status(500).send("Discord login failed");
+    const token = jwt.sign({ id: ins.rows[0].id, username }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ ok: true, token, user: ins.rows[0] });
+  } catch {
+    res.status(400).json({ ok: false, error: "username already used" });
   }
 });
 
-// ----------------- ME -----------------
-app.get("/api/me", requireAuth, async (req, res) => {
+// Login
+app.post("/api/auth/login", async (req, res) => {
+  const username = String(req.body?.username || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+
   const u = await pool.query(
-    `select id, discord_id, discord_username, discord_avatar, balance_int, created_at
-     from users where id=$1`,
-    [req.user.id]
+    `select id,username,password_hash,balance_int,created_at from users_local where username=$1`,
+    [username]
   );
+  if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad login" });
+
+  const ok = await bcrypt.compare(password, u.rows[0].password_hash);
+  if (!ok) return res.status(401).json({ ok: false, error: "bad login" });
+
+  const token = jwt.sign({ id: u.rows[0].id, username }, JWT_SECRET, { expiresIn: "30d" });
+  res.json({
+    ok: true,
+    token,
+    user: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, created_at: u.rows[0].created_at }
+  });
+});
+
+// Me
+app.get("/api/me", requireAuth, async (req, res) => {
+  const u = await pool.query(`select id,username,balance_int,created_at from users_local where id=$1`, [req.user.id]);
   res.json({ ok: true, me: u.rows[0] });
 });
 
-// ----------------- SETTINGS -----------------
+// ================= SETTINGS =================
 app.get("/api/settings", async (req, res) => {
   const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
   res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 80) });
@@ -407,7 +272,7 @@ app.post("/api/admin/settings", requireAdmin, async (req, res) => {
   res.json({ ok: true, rate });
 });
 
-// ----------------- PRODUCTS -----------------
+// ================= PRODUCTS =================
 app.get("/api/products", async (req, res) => {
   const rows = await pool.query(`
     select id,code,title,kind,age_pots,bucks,price_int,stock_int,note,sold,purchases_count
@@ -442,9 +307,7 @@ app.post("/api/admin/products/mark-sold", requireAdmin, async (req, res) => {
 
   const note = p.rows[0].note.includes("--sold")
     ? p.rows[0].note
-    : p.rows[0].note
-    ? `${p.rows[0].note} --sold`
-    : "--sold";
+    : (p.rows[0].note ? `${p.rows[0].note} --sold` : "--sold");
 
   await pool.query(
     `update products set sold=true, stock_int=0, sold_at=now(), note=$2 where code=$1`,
@@ -453,7 +316,7 @@ app.post("/api/admin/products/mark-sold", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ----------------- ORDERS -----------------
+// ================= ORDERS =================
 app.post("/api/orders/create", requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
@@ -476,7 +339,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   }
 
   const created = await pool.query(
-    `insert into orders (user_id, cart, total_int) values ($1,$2,$3) returning id,status,total_int`,
+    `insert into orders (user_id, cart, total_int) values ($1,$2,$3) returning id,status,total_int,created_at`,
     [req.user.id, JSON.stringify(cart), total]
   );
 
@@ -491,7 +354,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   res.json({ ok: true, order: created.rows[0] });
 });
 
-// ----------------- PAYMENT SLOTS -----------------
+// ================= PAYMENT SLOTS =================
 app.get("/api/payment-slots", async (req, res) => {
   const rows = await pool.query(
     `select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`
@@ -527,19 +390,18 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
 
   const item_key = s.rows[0].item_key;
   const points = Number(s.rows[0].points_per_unit) * qty;
-
   const expected = { [item_key]: qty };
 
   const ins = await pool.query(
     `insert into expected_payments (user_id,type,expected,points_to_credit,receiver_account)
-     values ($1,'slot',$2,$3,$4) returning id,status`,
+     values ($1,'slot',$2,$3,$4) returning id,status,created_at`,
     [req.user.id, JSON.stringify(expected), points, receiver_account]
   );
 
   res.json({ ok: true, expected_payment: ins.rows[0], expected, points });
 });
 
-// ----------------- INVENTORY INGEST -----------------
+// ================= INVENTORY INGEST =================
 app.post("/inventory", requireInventoryKey, async (req, res) => {
   const receiver_account = String(req.body?.user || "unknown");
   const snapshot = req.body;
@@ -569,7 +431,7 @@ app.post("/inventory", requireInventoryKey, async (req, res) => {
   for (const p of pending.rows) {
     if (satisfies(delta, p.expected)) {
       await pool.query(`update expected_payments set status='matched' where id=$1`, [p.id]);
-      await pool.query(`update users set balance_int = balance_int + $1 where id=$2`, [
+      await pool.query(`update users_local set balance_int = balance_int + $1 where id=$2`, [
         Number(p.points_to_credit),
         p.user_id,
       ]);
@@ -580,7 +442,7 @@ app.post("/inventory", requireInventoryKey, async (req, res) => {
   res.json({ ok: true, delta, matched });
 });
 
-// ----------------- LEADERBOARD + MY ACCOUNTS -----------------
+// ================= LEADERBOARD + MY ACCOUNTS =================
 app.get("/api/leaderboard", async (req, res) => {
   const rows = await pool.query(`
     select product_code, sum(qty)::int as buys
@@ -610,7 +472,7 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
 });
 
-// Start DB init AFTER listen (and do not crash server)
+// DB init after listen (never kills server)
 initDb()
   .then(() => console.log("✅ DB ready"))
   .catch((e) => console.error("❌ DB init error (server still running):", e?.message || e));
