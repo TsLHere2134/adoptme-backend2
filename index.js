@@ -107,7 +107,6 @@ function satisfies(delta, expected) {
 
 // --------- DB INIT ----------
 async function initDb() {
-  // ✅ Use NEW table users_local so we don't fight your old broken users table
   await pool.query(`
     create table if not exists users_local (
       id bigserial primary key,
@@ -180,6 +179,14 @@ async function initDb() {
       received_at timestamptz not null default now(),
       data jsonb not null
     );
+  `);
+
+  // ✅ MIGRATIONS (fix older existing tables that are missing columns)
+  await pool.query(`
+    alter table products add column if not exists kind text not null default 'account';
+    alter table products add column if not exists sold boolean not null default false;
+    alter table products add column if not exists sold_at timestamptz;
+    alter table products add column if not exists purchases_count int not null default 0;
   `);
 
   await pool.query(`
