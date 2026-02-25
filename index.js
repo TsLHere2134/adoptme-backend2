@@ -9,6 +9,39 @@ const app = express();
 app.get("/health", (req, res) => res.status(200).send("ok"));
 app.get("/", (req, res) => res.status(200).send("API running ✅"));
 
+app.get("/debug/env", (req, res) => {
+  res.json({
+    ok: true,
+    hasClientId: Boolean(process.env.DISCORD_CLIENT_ID),
+    hasClientSecret: Boolean(process.env.DISCORD_CLIENT_SECRET),
+    redirectUri: process.env.DISCORD_REDIRECT_URI || null,
+    frontendUrl: process.env.FRONTEND_URL || null
+  });
+});
+
+app.get("/api/auth/discord", (req, res) => {
+  try {
+    if (!DISCORD_CLIENT_ID || !DISCORD_REDIRECT_URI) {
+      return res.status(500).send("Discord OAuth not configured (missing env vars)");
+    }
+
+    const state = base64url(crypto.randomBytes(24));
+    const params = new URLSearchParams({
+      client_id: DISCORD_CLIENT_ID,
+      redirect_uri: DISCORD_REDIRECT_URI,
+      response_type: "code",
+      scope: "identify",
+      state,
+      prompt: "consent",
+    });
+
+    return res.redirect(`https://discord.com/api/oauth2/authorize?${params.toString()}`);
+  } catch (e) {
+    console.error("discord redirect error:", e);
+    return res.status(500).send("discord redirect error");
+  }
+});
+
 app.use(express.json({ limit: "5mb" }));
 
 // --- CORS (website can call API)
