@@ -414,40 +414,43 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
 app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const items = req.body?.items || {};
-  if (!receiver_account) return res.status(400).json({ ok:false, error:"receiver_account required" });
-  if (!items || typeof items !== "object") return res.status(400).json({ ok:false, error:"items required" });
 
-  // Load slots once
+  if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
+  if (!items || typeof items !== "object") return res.status(400).json({ ok: false, error: "items object required" });
+
+  // sanitize + compute points using payment_slots
   const rows = await pool.query(`select slot, enabled, item_key, points_per_unit from payment_slots`);
-  const byKey = new Map();
-  for (const r of rows.rows) {
-    if (r.enabled && r.item_key) byKey.set(String(r.item_key), r);
+  const byKey = new Map(rows.rows.map(r => [String(r.item_key || ""), r]));
+
+  let expected = {};
+  let totalPoints = 0;
+
+  for (const [k, v] of Object.entries(items)) {
+    const key = String(k || "").trim();
+    const qty = Math.floor(Number(v || 0));
+
+    if (!key || qty <= 0) continue;
+
+    const slot = byKey.get(key);
+    if (!slot || !slot.enabled) {
+      return res.status(400).json({ ok: false, error: `slot disabled or unknown item_key: ${key}` });
+    }
+
+    expected[key] = qty;
+    totalPoints += Number(slot.points_per_unit || 0) * qty;
   }
 
-  // Validate + compute
-  const expected = {};
-  let points = 0;
-
-  for (const [key, qtyRaw] of Object.entries(items)) {
-    const keyStr = String(key).trim();
-    const qty = Math.max(1, Number(qtyRaw));
-
-    if (!byKey.has(keyStr)) return res.status(400).json({ ok:false, error:`item disabled/unknown: ${keyStr}` });
-    if (!Number.isFinite(qty)) return res.status(400).json({ ok:false, error:`bad qty for ${keyStr}` });
-
-    expected[keyStr] = qty;
-    points += Number(byKey.get(keyStr).points_per_unit) * qty;
+  if (Object.keys(expected).length === 0) {
+    return res.status(400).json({ ok: false, error: "no valid items selected" });
   }
-
-  if (Object.keys(expected).length === 0) return res.status(400).json({ ok:false, error:"no items selected" });
 
   const ins = await pool.query(
     `insert into expected_payments (user_id,type,expected,points_to_credit,receiver_account)
      values ($1,'multi',$2,$3,$4) returning id,status,created_at`,
-    [req.user.id, JSON.stringify(expected), points, receiver_account]
+    [req.user.id, JSON.stringify(expected), totalPoints, receiver_account]
   );
 
-  res.json({ ok:true, expected_payment: ins.rows[0], expected, points });
+  res.json({ ok: true, expected_payment: ins.rows[0], expected, points: totalPoints });
 });
 
 // ================= INVENTORY INGEST =================
