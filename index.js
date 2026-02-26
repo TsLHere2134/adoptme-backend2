@@ -11,6 +11,9 @@ app.get("/", (req, res) => res.status(200).send("API running ✅"));
 
 app.use(express.json({ limit: "5mb" }));
 
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, status: "up", ts: Date.now() });
+});
 // --- CORS
 app.use((req, res, next) => {
   const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
