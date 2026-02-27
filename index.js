@@ -17,9 +17,10 @@ app.get("/api/health", (req, res) => {
 
 // --- CORS
 app.use((req, res, next) => {
-  const allowed = new Set(["https://adoptmehub.com", "https://www.adoptmehub.com"]);
   const origin = req.headers.origin;
-  if (origin && allowed.has(origin)) {
+  // Reflect origin back — allows adoptmehub.com, localhost, and any other origin
+  // Tighten this list in production if needed
+  if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
@@ -185,6 +186,17 @@ async function initDb() {
       receiver_account text not null,
       received_at timestamptz not null default now(),
       data jsonb not null
+    );
+
+    create table if not exists account_credentials (
+      id bigserial primary key,
+      product_code text not null unique,
+      roblox_user text not null,
+      roblox_pass text not null,
+      note text not null default '',
+      assigned_order_id bigint,
+      assigned_at timestamptz,
+      created_at timestamptz not null default now()
     );
   `);
 
@@ -445,6 +457,88 @@ app.post("/api/admin/products/delete", requireAuth, requireAdmin, async (req, re
   res.json({ ok: true });
 });
 
+// ================= ADMIN: CREDENTIALS =================
+
+// Add a single credential slot for a product
+app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, res) => {
+  const product_code = String(req.body?.product_code || "").trim();
+  const roblox_user  = String(req.body?.roblox_user  || "").trim();
+  const roblox_pass  = String(req.body?.roblox_pass  || "").trim();
+  const note         = String(req.body?.note         || "").trim();
+  if (!product_code || !roblox_user || !roblox_pass)
+    return res.status(400).json({ ok: false, error: "product_code, roblox_user, roblox_pass required" });
+  const r = await pool.query(
+    `insert into account_credentials (product_code, roblox_user, roblox_pass, note)
+     values ($1,$2,$3,$4)
+     returning id, product_code, roblox_user, assigned_order_id, created_at`,
+    [product_code, roblox_user, roblox_pass, note]
+  );
+  res.json({ ok: true, credential: r.rows[0] });
+});
+
+// Mass import credentials — array of { product_code, roblox_user, roblox_pass, note }
+// Also accepts CSV text: one line per account in format "CODE,user,pass" or "CODE,user,pass,note"
+app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req, res) => {
+  let rows = [];
+
+  if (typeof req.body?.csv === "string") {
+    // Parse CSV text
+    const lines = req.body.csv.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    for (const line of lines) {
+      const parts = line.split(",").map(p => p.trim());
+      if (parts.length < 3) continue;
+      rows.push({
+        product_code: parts[0],
+        roblox_user:  parts[1],
+        roblox_pass:  parts[2],
+        note:         parts[3] || "",
+      });
+    }
+  } else if (Array.isArray(req.body?.rows)) {
+    rows = req.body.rows;
+  }
+
+  if (!rows.length) return res.status(400).json({ ok: false, error: "no valid rows" });
+
+  let inserted = 0, skipped = 0;
+  for (const row of rows) {
+    const code = String(row.product_code || "").trim();
+    const u    = String(row.roblox_user  || "").trim();
+    const p    = String(row.roblox_pass  || "").trim();
+    const n    = String(row.note         || "").trim();
+    if (!code || !u || !p) { skipped++; continue; }
+    try {
+      await pool.query(
+        `insert into account_credentials (product_code, roblox_user, roblox_pass, note)
+         values ($1,$2,$3,$4)`,
+        [code, u, p, n]
+      );
+      inserted++;
+    } catch { skipped++; }
+  }
+
+  res.json({ ok: true, inserted, skipped, total: rows.length });
+});
+
+// List credentials for a product (admin only — shows passwords)
+app.get("/api/admin/credentials/:code", requireAuth, requireAdmin, async (req, res) => {
+  const code = String(req.params.code || "").trim();
+  const r = await pool.query(
+    `select id, product_code, roblox_user, roblox_pass, note, assigned_order_id, assigned_at, created_at
+     from account_credentials where product_code=$1 order by id asc`,
+    [code]
+  );
+  res.json({ ok: true, credentials: r.rows });
+});
+
+// Delete a single credential by id
+app.post("/api/admin/credentials/delete", requireAuth, requireAdmin, async (req, res) => {
+  const id = Number(req.body?.id);
+  if (!id) return res.status(400).json({ ok: false, error: "id required" });
+  await pool.query(`delete from account_credentials where id=$1`, [id]);
+  res.json({ ok: true });
+});
+
 // ================= ORDERS =================
 app.post("/api/orders/create", requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
@@ -457,24 +551,98 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   );
   const map = new Map(prods.rows.map((p) => [p.code, p]));
 
+  // Validate stock and compute total
   let total = 0;
   for (const item of cart) {
     const code = String(item.code || "");
     const qty = Math.max(1, Number(item.qty || 1));
     const p = map.get(code);
-    if (!p) return res.status(400).json({ ok: false, error: `unknown ${code}` });
+    if (!p) return res.status(400).json({ ok: false, error: `unknown product: ${code}` });
     if (p.sold || p.stock_int < qty) return res.status(400).json({ ok: false, error: `out of stock: ${code}` });
     total += Number(p.price_int) * qty;
   }
 
-  const created = await pool.query(
-    `insert into orders (user_id, cart, total_int) values ($1,$2,$3) returning id,status,total_int,created_at`,
-    [req.user.id, JSON.stringify(cart), total]
+  // Check balance
+  const userRow = await pool.query(
+    `select id, balance_int from users_local where id=$1`,
+    [req.user.id]
+  );
+  const user = userRow.rows[0];
+  if (!user) return res.status(404).json({ ok: false, error: "user not found" });
+  if (Number(user.balance_int) < total) {
+    return res.status(400).json({
+      ok: false,
+      error: `Insufficient balance. Need ${total} tokens, you have ${user.balance_int}.`,
+    });
+  }
+
+  // Deduct balance
+  await pool.query(
+    `update users_local set balance_int = balance_int - $1 where id=$2`,
+    [total, req.user.id]
   );
 
+  // Build enriched cart with credentials
+  const enrichedCart = [];
   for (const item of cart) {
+    const code = String(item.code || "");
+    const qty = Math.max(1, Number(item.qty || 1));
+
+    // Mark product sold / decrement stock
+    await pool.query(
+      `update products set stock_int = GREATEST(0, stock_int - $1),
+        sold = (stock_int - $1 <= 0),
+        sold_at = case when (stock_int - $1 <= 0) then now() else sold_at end,
+        purchases_count = purchases_count + $1
+       where code=$2`,
+      [qty, code]
+    );
+
+    // Fetch and assign credentials
+    const cred = await pool.query(
+      `select id, roblox_user, roblox_pass, note
+       from account_credentials
+       where product_code=$1 and assigned_order_id is null
+       limit 1`,
+      [code]
+    );
+    let credentials = null;
+    if (cred.rows[0]) {
+      credentials = {
+        user: cred.rows[0].roblox_user,
+        pass: cred.rows[0].roblox_pass,
+        note: cred.rows[0].note,
+      };
+      // Mark as assigned
+      await pool.query(
+        `update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`,
+        [0, cred.rows[0].id] // will be updated below once order is created
+      );
+      // store id to update after order insert
+      item._credId = cred.rows[0].id;
+    }
+    enrichedCart.push({ code, qty, credentials });
+  }
+
+  // Create order with enriched cart (including credentials)
+  const created = await pool.query(
+    `insert into orders (user_id, cart, total_int, status)
+     values ($1,$2,$3,'completed')
+     returning id,status,total_int,created_at`,
+    [req.user.id, JSON.stringify(enrichedCart), total]
+  );
+  const orderId = created.rows[0].id;
+
+  // Update credential assignments with real order id
+  for (const item of cart) {
+    if (item._credId) {
+      await pool.query(
+        `update account_credentials set assigned_order_id=$1 where id=$2`,
+        [orderId, item._credId]
+      );
+    }
     await pool.query(`insert into order_items(order_id,product_code,qty) values ($1,$2,$3)`, [
-      created.rows[0].id,
+      orderId,
       String(item.code),
       Math.max(1, Number(item.qty || 1)),
     ]);
