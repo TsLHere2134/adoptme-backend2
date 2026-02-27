@@ -11,6 +11,23 @@ app.get("/", (req, res) => res.status(200).send("API running ✅"));
 
 app.use(express.json({ limit: "5mb" }));
 
+// ✅ Catch malformed JSON bodies — returns JSON instead of HTML 400
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    console.error("BAD JSON body:", err.message);
+    return res.status(400).json({ ok: false, error: "invalid JSON in request body" });
+  }
+  next(err);
+});
+
+// ✅ Global async error handler — catches unhandled promise rejections in routes
+app.use((err, req, res, next) => {
+  console.error("Unhandled route error:", err?.message || err);
+  if (!res.headersSent) {
+    res.status(500).json({ ok: false, error: err?.message || "internal server error" });
+  }
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, status: "up", ts: Date.now() });
 });
