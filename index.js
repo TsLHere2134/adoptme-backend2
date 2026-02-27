@@ -556,102 +556,151 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
 
-  const codes = [...new Set(cart.map((i) => String(i.code || "")))];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  // Lock products for update to prevent race conditions
-  const prods = await pool.query(
-    `select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`,
-    [codes]
-  );
-  const map = new Map(prods.rows.map((p) => [p.code, p]));
+    const codes = [...new Set(cart.map((i) => String(i.code || "")))];
 
-  // Validate and compute total
-  let total = 0;
-  for (const item of cart) {
-    const code = String(item.code || "");
-    const qty = Math.max(1, Number(item.qty || 1));
-    const p = map.get(code);
-    if (!p) return res.status(400).json({ ok: false, error: `unknown product: ${code}` });
-    if (p.sold || Number(p.stock_int) < qty)
-      return res.status(400).json({ ok: false, error: `out of stock: ${code}` });
-    total += Number(p.price_int) * qty;
-  }
+    // Lock products inside transaction to prevent race conditions
+    const prods = await client.query(
+      `select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`,
+      [codes]
+    );
+    const map = new Map(prods.rows.map((p) => [p.code, p]));
 
-  // Check balance (re-read for accuracy)
-  const userRow = await pool.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
-  const user = userRow.rows[0];
-  if (!user) return res.status(404).json({ ok: false, error: "user not found" });
-  if (Number(user.balance_int) < total) {
-    return res.status(400).json({
-      ok: false,
-      error: `Not enough tokens. Need ${total}, you have ${user.balance_int}.`,
+    // Validate stock and compute total
+    let total = 0;
+    for (const item of cart) {
+      const code = String(item.code || "");
+      const qty = Math.max(1, Number(item.qty || 1));
+      const p = map.get(code);
+      if (!p) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: `unknown product: ${code}` });
+      }
+      if (p.sold || Number(p.stock_int) < qty) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: `out of stock: ${code}` });
+      }
+      total += Number(p.price_int) * qty;
+    }
+
+    // Check balance inside transaction
+    const userRow = await client.query(
+      `select id, balance_int from users_local where id=$1 for update`,
+      [req.user.id]
+    );
+    const user = userRow.rows[0];
+    if (!user) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "user not found" });
+    }
+    if (Number(user.balance_int) < total) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        error: `Not enough tokens. Need ${total}, you have ${user.balance_int}.`,
+      });
+    }
+
+    // Deduct balance
+    await client.query(
+      `update users_local set balance_int = balance_int - $1 where id=$2`,
+      [total, req.user.id]
+    );
+
+    // Process each cart item
+    const enrichedCart = [];
+    for (const item of cart) {
+      const code = String(item.code || "");
+      const qty  = Math.max(1, Number(item.qty || 1));
+
+      // Decrement stock and mark sold using a subquery so we read the NEW value correctly
+      await client.query(`
+        update products
+        set stock_int       = GREATEST(0, stock_int - $1),
+            purchases_count = purchases_count + $1
+        where code = $2
+      `, [qty, code]);
+      // Separate update to set sold flag based on the now-updated stock_int
+      await client.query(`
+        update products
+        set sold    = (stock_int <= 0),
+            sold_at = case when stock_int <= 0 then now() else sold_at end
+        where code = $1
+      `, [code]);
+
+      // Grab unassigned credential (FIFO) and lock it
+      const cred = await client.query(`
+        select id, roblox_user, roblox_pass, note, age_pots, bucks
+        from account_credentials
+        where product_code = $1 and assigned_order_id is null
+        order by id asc
+        limit 1
+        for update skip locked
+      `, [code]);
+
+      let credentials = null;
+      let credId = null;
+      if (cred.rows[0]) {
+        credId = cred.rows[0].id;
+        credentials = {
+          user:     cred.rows[0].roblox_user,
+          pass:     cred.rows[0].roblox_pass,
+          note:     cred.rows[0].note,
+          age_pots: cred.rows[0].age_pots,
+          bucks:    cred.rows[0].bucks,
+        };
+        // Lock it to this transaction immediately
+        await client.query(
+          `update account_credentials set assigned_order_id=-1 where id=$1`,
+          [credId]
+        );
+      }
+
+      enrichedCart.push({ code, qty, credentials, _credId: credId });
+    }
+
+    // Create order record
+    const created = await client.query(`
+      insert into orders (user_id, cart, total_int, status)
+      values ($1,$2,$3,'completed')
+      returning id, status, total_int, created_at
+    `, [req.user.id, JSON.stringify(enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials }))), total]);
+
+    const orderId = created.rows[0].id;
+
+    // Finalize credential assignments + order_items
+    for (const item of enrichedCart) {
+      if (item._credId) {
+        await client.query(
+          `update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`,
+          [orderId, item._credId]
+        );
+      }
+      await client.query(
+        `insert into order_items(order_id,product_code,qty) values($1,$2,$3)`,
+        [orderId, item.code, item.qty]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      order: {
+        ...created.rows[0],
+        cart: enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials })),
+      },
     });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("orders/create error:", err?.message || err);
+    res.status(500).json({ ok: false, error: "Order failed: " + (err?.message || "server error") });
+  } finally {
+    client.release();
   }
-
-  // Deduct balance
-  await pool.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [total, req.user.id]);
-
-  // Process each cart item
-  const enrichedCart = [];
-  for (const item of cart) {
-    const code = String(item.code || "");
-    const qty  = Math.max(1, Number(item.qty || 1));
-
-    // Decrement stock atomically, mark sold if hits 0
-    await pool.query(`
-      update products
-      set stock_int       = GREATEST(0, stock_int - $1),
-          sold            = (stock_int - $1 <= 0),
-          sold_at         = case when (stock_int - $1 <= 0) then now() else sold_at end,
-          purchases_count = purchases_count + $1
-      where code = $2
-    `, [qty, code]);
-
-    // Grab available credential (unassigned, FIFO)
-    const cred = await pool.query(`
-      select id, roblox_user, roblox_pass, note, age_pots, bucks
-      from account_credentials
-      where product_code = $1 and assigned_order_id is null
-      order by id asc
-      limit 1
-    `, [code]);
-
-    let credentials = null;
-    let credId = null;
-    if (cred.rows[0]) {
-      credId = cred.rows[0].id;
-      credentials = {
-        user:     cred.rows[0].roblox_user,
-        pass:     cred.rows[0].roblox_pass,
-        note:     cred.rows[0].note,
-        age_pots: cred.rows[0].age_pots,
-        bucks:    cred.rows[0].bucks,
-      };
-      // Temporarily mark with 0 to lock it from parallel orders
-      await pool.query(`update account_credentials set assigned_order_id=0 where id=$1`, [credId]);
-    }
-
-    enrichedCart.push({ code, qty, credentials, _credId: credId });
-  }
-
-  // Create order
-  const created = await pool.query(`
-    insert into orders (user_id, cart, total_int, status)
-    values ($1,$2,$3,'completed')
-    returning id, status, total_int, created_at
-  `, [req.user.id, JSON.stringify(enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials }))), total]);
-
-  const orderId = created.rows[0].id;
-
-  // Finalize — update credential assignments + order_items
-  for (const item of enrichedCart) {
-    if (item._credId) {
-      await pool.query(`update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`, [orderId, item._credId]);
-    }
-    await pool.query(`insert into order_items(order_id,product_code,qty) values($1,$2,$3)`, [orderId, item.code, item.qty]);
-  }
-
-  res.json({ ok: true, order: { ...created.rows[0], cart: enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials })) } });
 });
 
 // ================= PAYMENT SLOTS =================
