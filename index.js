@@ -64,7 +64,11 @@ function requireAuth(req, res, next) {
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) return res.status(401).json({ ok: false, error: "missing token" });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET);
+    // Always coerce id to integer — JWT JSON can turn bigint into string
+    payload.id = Number(payload.id);
+    if (!payload.id || isNaN(payload.id)) return res.status(401).json({ ok: false, error: "invalid token payload" });
+    req.user = payload;
     next();
   } catch {
     return res.status(401).json({ ok: false, error: "invalid token" });
@@ -662,10 +666,10 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       enrichedCart.push({ code, qty, credentials, _credId: credId });
     }
 
-    // Create order record
+    // Create order record — cast user_id explicitly to bigint to satisfy FK
     const created = await client.query(`
       insert into orders (user_id, cart, total_int, status)
-      values ($1,$2,$3,'completed')
+      values ($1::bigint,$2,$3,'completed')
       returning id, status, total_int, created_at
     `, [req.user.id, JSON.stringify(enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials }))), total]);
 
