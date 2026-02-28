@@ -181,12 +181,15 @@ async function computePriceFromRate(agePots) {
 
 // --------- DB INIT ----------
 async function initDb() {
+  // ✅ Create tables (NO JS code inside SQL strings)
   await pool.query(`
     create table if not exists users_local (
       id bigserial primary key,
       username text not null unique,
       password_hash text not null,
       balance_int bigint not null default 0,
+      is_admin boolean not null default false,
+      is_blacklisted boolean not null default false,
       created_at timestamptz not null default now()
     );
 
@@ -270,17 +273,6 @@ async function initDb() {
       assigned_order_id bigint,
       assigned_at timestamptz,
       created_at timestamptz not null default now()
-
-      await pool.query(`
-  alter table inventory_snapshots
-    add column if not exists delta jsonb not null default '{}'::jsonb;
-
-  alter table inventory_snapshots
-    add column if not exists receiver_account text not null default 'unknown';
-
-  alter table inventory_snapshots
-    add column if not exists received_at timestamptz not null default now();
-`);
     );
   `);
 
@@ -297,6 +289,11 @@ async function initDb() {
 
     alter table account_credentials add column if not exists age_pots int not null default 0;
     alter table account_credentials add column if not exists bucks int not null default 0;
+
+    -- inventory_snapshots columns (in case old table existed)
+    alter table inventory_snapshots add column if not exists delta jsonb not null default '{}'::jsonb;
+    alter table inventory_snapshots add column if not exists receiver_account text not null default 'unknown';
+    alter table inventory_snapshots add column if not exists received_at timestamptz not null default now();
 
     -- ✅ 45-minute expiry support
     alter table expected_payments add column if not exists expires_at timestamptz;
@@ -336,7 +333,6 @@ async function initDb() {
     );
   }
 }
-
 
 // ================= AUTH =================
 app.post("/api/auth/register", async (req, res) => {
