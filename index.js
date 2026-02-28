@@ -1,3 +1,6 @@
+// server.js  (or index.js)
+// NOTE: If you use `import ...` like this, make sure package.json has: { "type": "module" }
+
 import express from "express";
 import { Pool } from "pg";
 import jwt from "jsonwebtoken";
@@ -42,6 +45,7 @@ app.use((req, res, next) => {
 // ✅ Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // Railway Postgres typically needs SSL; this works for Railway.
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
@@ -58,8 +62,9 @@ function requireAdminKey(req, res, next) {
 
 function requireInventoryKey(req, res, next) {
   if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
-  if (req.header("x-inventory-key") !== INVENTORY_API_KEY)
+  if (req.header("x-inventory-key") !== INVENTORY_API_KEY) {
     return res.status(401).json({ ok: false, error: "bad inventory key" });
+  }
   next();
 }
 
@@ -70,7 +75,7 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     payload.id = Number(payload.id);
-    if (!payload.id || isNaN(payload.id)) return res.status(401).json({ ok: false, error: "invalid token payload" });
+    if (!payload.id || Number.isNaN(payload.id)) return res.status(401).json({ ok: false, error: "invalid token payload" });
     req.user = payload;
     next();
   } catch {
@@ -102,9 +107,9 @@ function countFromSnapshot(snapshot) {
 
 function deltaCounts(prevCounts, newCounts) {
   const delta = {};
-  const keys = new Set([...Object.keys(prevCounts), ...Object.keys(newCounts)]);
+  const keys = new Set([...Object.keys(prevCounts || {}), ...Object.keys(newCounts || {})]);
   for (const k of keys) {
-    const d = (newCounts[k] || 0) - (prevCounts[k] || 0);
+    const d = (newCounts?.[k] || 0) - (prevCounts?.[k] || 0);
     if (d > 0) delta[k] = d;
   }
   return delta;
@@ -112,62 +117,18 @@ function deltaCounts(prevCounts, newCounts) {
 
 function satisfies(delta, expected) {
   for (const [k, need] of Object.entries(expected || {})) {
-    if ((delta[k] || 0) < Number(need)) return false;
+    if ((delta?.[k] || 0) < Number(need)) return false;
   }
   return true;
 }
 
 // --------- HELPERS ----------
 function makeCode(username) {
-  const base = String(username || "ACC").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(3, "X");
-  const rand = String(Math.floor(1000 + Math.random() * 9000));
-  return "U" + base + rand;
-}
-
-// --- pricing helper
-async function computePriceFromRate(agePots) {
-  const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
-  const rate = Math.max(1, Number(r.rows[0]?.value || 80));
-  return Math.ceil(Number(agePots || 0) / rate);
-}
-
-// --------- INVENTORY DELTA HELPERS ----------
-function countFromSnapshot(snapshot) {
-  const counts = {};
-  const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
-  for (const p of pets) {
-    const k = String(p?.name || p?.id || "unknown_pet");
-    counts[k] = (counts[k] || 0) + 1;
-  }
-  const food = Array.isArray(snapshot?.food) ? snapshot.food : [];
-  for (const f of food) {
-    const k = String(f?.name || f?.id || "unknown_food");
-    const qty = Number(f?.quantity || 1);
-    counts[k] = (counts[k] || 0) + qty;
-  }
-  return counts;
-}
-
-function deltaCounts(prevCounts, newCounts) {
-  const delta = {};
-  const keys = new Set([...Object.keys(prevCounts), ...Object.keys(newCounts)]);
-  for (const k of keys) {
-    const d = (newCounts[k] || 0) - (prevCounts[k] || 0);
-    if (d > 0) delta[k] = d;
-  }
-  return delta;
-}
-
-function satisfies(delta, expected) {
-  for (const [k, need] of Object.entries(expected || {})) {
-    if ((delta[k] || 0) < Number(need)) return false;
-  }
-  return true;
-}
-
-// --------- HELPERS ----------
-function makeCode(username) {
-  const base = String(username || "ACC").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(3, "X");
+  const base = String(username || "ACC")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 4)
+    .padEnd(3, "X");
   const rand = String(Math.floor(1000 + Math.random() * 9000));
   return "U" + base + rand;
 }
@@ -181,7 +142,7 @@ async function computePriceFromRate(agePots) {
 
 // --------- DB INIT ----------
 async function initDb() {
-  // ✅ Create tables (NO JS code inside SQL strings)
+  // ✅ Create tables
   await pool.query(`
     create table if not exists users_local (
       id bigserial primary key,
@@ -340,6 +301,7 @@ app.post("/api/auth/register", async (req, res) => {
   const password = String(req.body?.password || "");
   if (username.length < 3) return res.status(400).json({ ok: false, error: "username too short" });
   if (password.length < 6) return res.status(400).json({ ok: false, error: "password too short (min 6)" });
+
   const hash = await bcrypt.hash(password, 10);
   try {
     const ins = await pool.query(
@@ -348,7 +310,9 @@ app.post("/api/auth/register", async (req, res) => {
       [username, hash]
     );
     const user = ins.rows[0];
-    const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, { expiresIn: "30d" });
+    const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, {
+      expiresIn: "30d",
+    });
     res.json({ ok: true, token, user });
   } catch {
     res.status(400).json({ ok: false, error: "username already used" });
@@ -364,12 +328,16 @@ app.post("/api/auth/login", async (req, res) => {
   );
   if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad login" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
+
   const ok = await bcrypt.compare(password, u.rows[0].password_hash);
   if (!ok) return res.status(401).json({ ok: false, error: "bad login" });
+
   const token = jwt.sign(
     { id: u.rows[0].id, username: u.rows[0].username, is_admin: u.rows[0].is_admin },
-    JWT_SECRET, { expiresIn: "30d" }
+    JWT_SECRET,
+    { expiresIn: "30d" }
   );
+
   res.json({
     ok: true,
     token,
@@ -378,8 +346,8 @@ app.post("/api/auth/login", async (req, res) => {
       username: u.rows[0].username,
       balance_int: u.rows[0].balance_int,
       is_admin: u.rows[0].is_admin,
-      created_at: u.rows[0].created_at
-    }
+      created_at: u.rows[0].created_at,
+    },
   });
 });
 
@@ -390,6 +358,7 @@ app.get("/api/me", requireAuth, async (req, res) => {
   );
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
+
   res.json({
     ok: true,
     me: {
@@ -397,8 +366,8 @@ app.get("/api/me", requireAuth, async (req, res) => {
       username: u.rows[0].username,
       balance_int: u.rows[0].balance_int,
       is_admin: u.rows[0].is_admin,
-      created_at: u.rows[0].created_at
-    }
+      created_at: u.rows[0].created_at,
+    },
   });
 });
 
@@ -420,13 +389,17 @@ app.post("/api/admin/settings", requireAdminKey, async (req, res) => {
 
 // ================= PRODUCTS =================
 app.get("/api/products", async (req, res) => {
+  // ✅ Safer GROUP BY to avoid strict Postgres complaints
   const rows = await pool.query(`
-    select p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
-           p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count,
-           count(c.id) filter (where c.assigned_order_id is null) as cred_count
+    select
+      p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
+      p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count,
+      count(c.id) filter (where c.assigned_order_id is null) as cred_count
     from products p
     left join account_credentials c on c.product_code = p.code
-    group by p.id
+    group by
+      p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
+      p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count, p.created_at
     order by p.created_at desc
   `);
   res.json({ ok: true, products: rows.rows });
@@ -436,8 +409,10 @@ app.get("/api/products", async (req, res) => {
 app.post("/api/admin/users/balance", requireAuth, requireAdmin, async (req, res) => {
   const username = String(req.body?.username || "").trim();
   const delta = Number(req.body?.delta || 0);
-  if (!username || !Number.isFinite(delta))
+  if (!username || !Number.isFinite(delta)) {
     return res.status(400).json({ ok: false, error: "username + numeric delta required" });
+  }
+
   const q = await pool.query(
     `update users_local set balance_int = GREATEST(0, balance_int + $1) where username=$2
      returning id,username,balance_int,is_blacklisted,is_admin`,
@@ -451,6 +426,7 @@ app.post("/api/admin/users/blacklist", requireAuth, requireAdmin, async (req, re
   const username = String(req.body?.username || "").trim();
   const value = !!req.body?.value;
   if (!username) return res.status(400).json({ ok: false, error: "username required" });
+
   const q = await pool.query(
     `update users_local set is_blacklisted=$1 where username=$2 returning id,username,is_blacklisted`,
     [value, username]
@@ -468,22 +444,31 @@ app.post("/api/admin/products/upsert", requireAuth, requireAdmin, async (req, re
 
   const price_int = Math.max(0, Math.trunc(Number(p.price_int || 0)));
   const stock_int = Math.max(0, Math.trunc(Number(p.stock_int ?? 1)));
-  const age_pots  = Math.max(0, Math.trunc(Number(p.age_pots || 0)));
-  const bucks     = Math.max(0, Math.trunc(Number(p.bucks || 0)));
-  const note      = String(p.note || "");
+  const age_pots = Math.max(0, Math.trunc(Number(p.age_pots || 0)));
+  const bucks = Math.max(0, Math.trunc(Number(p.bucks || 0)));
+  const note = String(p.note || "");
   const image_url = String(p.image_url || "");
-  const kind      = String(p.kind || "account");
-  const sold      = stock_int <= 0;
+  const kind = String(p.kind || "account");
+  const sold = stock_int <= 0;
 
-  const q = await pool.query(`
+  const q = await pool.query(
+    `
     insert into products (code,title,kind,age_pots,bucks,price_int,stock_int,note,image_url,sold)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     on conflict (code) do update set
-      title=excluded.title, kind=excluded.kind, age_pots=excluded.age_pots,
-      bucks=excluded.bucks, price_int=excluded.price_int, stock_int=excluded.stock_int,
-      note=excluded.note, image_url=excluded.image_url, sold=excluded.sold
+      title=excluded.title,
+      kind=excluded.kind,
+      age_pots=excluded.age_pots,
+      bucks=excluded.bucks,
+      price_int=excluded.price_int,
+      stock_int=excluded.stock_int,
+      note=excluded.note,
+      image_url=excluded.image_url,
+      sold=excluded.sold
     returning *;
-  `, [code, title, kind, age_pots, bucks, price_int, stock_int, note, image_url, sold]);
+  `,
+    [code, title, kind, age_pots, bucks, price_int, stock_int, note, image_url, sold]
+  );
 
   res.json({ ok: true, product: q.rows[0] });
 });
@@ -498,13 +483,15 @@ app.post("/api/admin/products/delete", requireAuth, requireAdmin, async (req, re
 // ================= ADMIN: CREDENTIALS =================
 app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, res) => {
   const product_code = String(req.body?.product_code || "").trim();
-  const roblox_user  = String(req.body?.roblox_user  || "").trim();
-  const roblox_pass  = String(req.body?.roblox_pass  || "").trim();
-  const note         = String(req.body?.note         || "").trim();
-  const age_pots     = Math.max(0, Number(req.body?.age_pots || 0));
-  const bucks        = Math.max(0, Number(req.body?.bucks    || 0));
-  if (!product_code || !roblox_user || !roblox_pass)
+  const roblox_user = String(req.body?.roblox_user || "").trim();
+  const roblox_pass = String(req.body?.roblox_pass || "").trim();
+  const note = String(req.body?.note || "").trim();
+  const age_pots = Math.max(0, Number(req.body?.age_pots || 0));
+  const bucks = Math.max(0, Number(req.body?.bucks || 0));
+
+  if (!product_code || !roblox_user || !roblox_pass) {
     return res.status(400).json({ ok: false, error: "product_code, roblox_user, roblox_pass required" });
+  }
 
   const r = await pool.query(
     `insert into account_credentials (product_code,roblox_user,roblox_pass,note,age_pots,bucks)
@@ -512,6 +499,7 @@ app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, re
      returning id,product_code,roblox_user,assigned_order_id,created_at`,
     [product_code, roblox_user, roblox_pass, note, age_pots, bucks]
   );
+
   await pool.query(`update products set stock_int = stock_int + 1, sold = false where code=$1`, [product_code]);
   res.json({ ok: true, credential: r.rows[0] });
 });
@@ -538,6 +526,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       const code = String(item.code || "");
       const qty = Math.max(1, Number(item.qty || 1));
       const p = map.get(code);
+
       if (!p) {
         await client.query("ROLLBACK");
         return res.status(400).json({ ok: false, error: `unknown product: ${code}` });
@@ -549,11 +538,9 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       total += Number(p.price_int) * qty;
     }
 
-    const userRow = await client.query(
-      `select id, balance_int from users_local where id=$1 for update`,
-      [req.user.id]
-    );
+    const userRow = await client.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
     const user = userRow.rows[0];
+
     if (!user) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "user not found" });
@@ -566,68 +553,78 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       });
     }
 
-    await client.query(
-      `update users_local set balance_int = balance_int - $1 where id=$2`,
-      [total, req.user.id]
-    );
+    await client.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [total, req.user.id]);
 
     const enrichedCart = [];
+
     for (const item of cart) {
       const code = String(item.code || "");
-      const qty  = Math.max(1, Number(item.qty || 1));
+      const qty = Math.max(1, Number(item.qty || 1));
 
-      await client.query(`
+      await client.query(
+        `
         update products
         set stock_int       = GREATEST(0, stock_int - $1),
             purchases_count = purchases_count + $1
         where code = $2
-      `, [qty, code]);
+      `,
+        [qty, code]
+      );
 
-      await client.query(`
+      await client.query(
+        `
         update products
         set sold    = (stock_int <= 0),
             sold_at = case when stock_int <= 0 then now() else sold_at end
         where code = $1
-      `, [code]);
+      `,
+        [code]
+      );
 
-      const cred = await client.query(`
+      const cred = await client.query(
+        `
         select id, roblox_user, roblox_pass, note, age_pots, bucks
         from account_credentials
         where product_code = $1 and assigned_order_id is null
         order by id asc
         limit 1
         for update skip locked
-      `, [code]);
+      `,
+        [code]
+      );
 
       let credentials = null;
       let credId = null;
+
       if (cred.rows[0]) {
         credId = cred.rows[0].id;
         credentials = {
-          user:     cred.rows[0].roblox_user,
-          pass:     cred.rows[0].roblox_pass,
-          note:     cred.rows[0].note,
+          user: cred.rows[0].roblox_user,
+          pass: cred.rows[0].roblox_pass,
+          note: cred.rows[0].note,
           age_pots: cred.rows[0].age_pots,
-          bucks:    cred.rows[0].bucks,
+          bucks: cred.rows[0].bucks,
         };
-        await client.query(
-          `update account_credentials set assigned_order_id=-1 where id=$1`,
-          [credId]
-        );
+
+        // temporary lock marker so another purchase doesn't take it in this txn
+        await client.query(`update account_credentials set assigned_order_id=-1 where id=$1`, [credId]);
       }
 
       enrichedCart.push({ code, qty, credentials, _credId: credId });
     }
 
-    const created = await client.query(`
+    const created = await client.query(
+      `
       insert into orders (user_id, cart, total_int, status)
       values ($1::bigint,$2,$3,'completed')
       returning id, status, total_int, created_at
-    `, [
-      req.user.id,
-      JSON.stringify(enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials }))),
-      total
-    ]);
+    `,
+      [
+        req.user.id,
+        JSON.stringify(enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials }))),
+        total,
+      ]
+    );
 
     const orderId = created.rows[0].id;
 
@@ -638,10 +635,11 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
           [orderId, item._credId]
         );
       }
-      await client.query(
-        `insert into order_items(order_id,product_code,qty) values($1,$2,$3)`,
-        [orderId, item.code, item.qty]
-      );
+      await client.query(`insert into order_items(order_id,product_code,qty) values($1,$2,$3)`, [
+        orderId,
+        item.code,
+        item.qty,
+      ]);
     }
 
     await client.query("COMMIT");
@@ -650,7 +648,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       ok: true,
       order: {
         ...created.rows[0],
-        cart: enrichedCart.map(i => ({ code: i.code, qty: i.qty, credentials: i.credentials })),
+        cart: enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials })),
       },
     });
   } catch (err) {
@@ -664,7 +662,9 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
 
 // ================= PAYMENT SLOTS =================
 app.get("/api/payment-slots", async (req, res) => {
-  const rows = await pool.query(`select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`);
+  const rows = await pool.query(
+    `select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`
+  );
   res.json({ ok: true, slots: rows.rows });
 });
 
@@ -675,6 +675,7 @@ app.post("/api/admin/payment-slots/set", requireAdminKey, async (req, res) => {
   const points_per_unit = Math.max(0, Number(req.body?.points_per_unit || 0));
   const image_url = req.body?.image_url ? String(req.body.image_url) : null;
   const enabled = Boolean(req.body?.enabled);
+
   await pool.query(
     `update payment_slots set title=$2,item_key=$3,points_per_unit=$4,image_url=$5,enabled=$6 where slot=$1`,
     [slot, title, item_key, points_per_unit, image_url, enabled]
@@ -718,33 +719,39 @@ app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const items = req.body?.items || {};
   if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
-  if (!items || typeof items !== "object" || Array.isArray(items))
+  if (!items || typeof items !== "object" || Array.isArray(items)) {
     return res.status(400).json({ ok: false, error: "items object required" });
+  }
 
   const rows = await pool.query(`select enabled,item_key,points_per_unit from payment_slots`);
-  const byKey = new Map(rows.rows.map(r => [String(r.item_key || ""), r]));
+  const byKey = new Map(rows.rows.map((r) => [String(r.item_key || ""), r]));
 
-  let expected = {}, totalPoints = 0;
+  let expected = {};
+  let totalPoints = 0;
+
   for (const [k, v] of Object.entries(items)) {
     const key = String(k || "").trim();
     const qty = Math.floor(Number(v || 0));
     if (!key || qty <= 0) continue;
-    const slot = byKey.get(key);
-    if (!slot || !slot.enabled)
+
+    const slotRow = byKey.get(key);
+    if (!slotRow || !slotRow.enabled) {
       return res.status(400).json({ ok: false, error: `slot disabled or unknown item_key: ${key}` });
+    }
+
     expected[key] = qty;
-    totalPoints += Number(slot.points_per_unit || 0) * qty;
+    totalPoints += Number(slotRow.points_per_unit || 0) * qty;
   }
 
-  if (!Object.keys(expected).length)
+  if (!Object.keys(expected).length) {
     return res.status(400).json({ ok: false, error: "no valid items selected" });
+  }
 
   const expected_payment = await createExpectedPayment(req.user.id, "multi", expected, totalPoints, receiver_account);
   res.json({ ok: true, expected_payment, expected, points: totalPoints });
 });
 
 // ================= INVENTORY INGEST =================
-// Accept BOTH paths:
 async function handleInventoryIngest(req, res) {
   const receiver_account = String(req.body?.receiver_account || req.body?.user || "unknown");
   const snapshot = req.body;
@@ -792,7 +799,10 @@ async function handleInventoryIngest(req, res) {
     // Find FIRST one that satisfies this delta (prevents paying multiple off same delta)
     let picked = null;
     for (const p of pending.rows) {
-      if (satisfies(delta, p.expected)) { picked = p; break; }
+      if (satisfies(delta, p.expected)) {
+        picked = p;
+        break;
+      }
     }
 
     if (picked) {
@@ -802,10 +812,10 @@ async function handleInventoryIngest(req, res) {
          where id=$1`,
         [picked.id, snapshotId]
       );
-      await client.query(
-        `update users_local set balance_int = balance_int + $1 where id=$2`,
-        [Number(picked.points_to_credit), picked.user_id]
-      );
+      await client.query(`update users_local set balance_int = balance_int + $1 where id=$2`, [
+        Number(picked.points_to_credit),
+        picked.user_id,
+      ]);
       matched.push({ expected_payment_id: picked.id, credited: Number(picked.points_to_credit) });
     }
 
@@ -834,10 +844,9 @@ app.get("/api/leaderboard", async (req, res) => {
 });
 
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
-  const rows = await pool.query(
-    `select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`,
-    [req.user.id]
-  );
+  const rows = await pool.query(`select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`, [
+    req.user.id,
+  ]);
   res.json({ ok: true, orders: rows.rows });
 });
 
@@ -850,7 +859,7 @@ setInterval(async () => {
       where status='pending' and expires_at <= now()
       returning id
     `);
-    if (r.rowCount) console.log("Expired expected_payments:", r.rows.map(x => x.id));
+    if (r.rowCount) console.log("Expired expected_payments:", r.rows.map((x) => x.id));
   } catch (e) {
     console.error("expire job error:", e?.message || e);
   }
@@ -865,6 +874,10 @@ process.on("SIGTERM", () => {
   console.log("⚠️ SIGTERM received — shutting down");
   server.close(() => process.exit(0));
 });
+
+// ✅ show real crashes in Railway logs
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
 initDb()
   .then(() => console.log("✅ DB ready"))
