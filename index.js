@@ -222,6 +222,17 @@ async function initDb() {
       assigned_order_id bigint,
       assigned_at timestamptz,
       created_at timestamptz not null default now()
+
+      await pool.query(`
+  alter table inventory_snapshots
+    add column if not exists delta jsonb not null default '{}'::jsonb;
+
+  alter table inventory_snapshots
+    add column if not exists receiver_account text not null default 'unknown';
+
+  alter table inventory_snapshots
+    add column if not exists received_at timestamptz not null default now();
+`);
     );
   `);
 
