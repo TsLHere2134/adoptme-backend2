@@ -131,6 +131,54 @@ async function computePriceFromRate(agePots) {
   return Math.ceil(Number(agePots || 0) / rate);
 }
 
+// --------- INVENTORY DELTA HELPERS ----------
+function countFromSnapshot(snapshot) {
+  const counts = {};
+  const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
+  for (const p of pets) {
+    const k = String(p?.name || p?.id || "unknown_pet");
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  const food = Array.isArray(snapshot?.food) ? snapshot.food : [];
+  for (const f of food) {
+    const k = String(f?.name || f?.id || "unknown_food");
+    const qty = Number(f?.quantity || 1);
+    counts[k] = (counts[k] || 0) + qty;
+  }
+  return counts;
+}
+
+function deltaCounts(prevCounts, newCounts) {
+  const delta = {};
+  const keys = new Set([...Object.keys(prevCounts), ...Object.keys(newCounts)]);
+  for (const k of keys) {
+    const d = (newCounts[k] || 0) - (prevCounts[k] || 0);
+    if (d > 0) delta[k] = d;
+  }
+  return delta;
+}
+
+function satisfies(delta, expected) {
+  for (const [k, need] of Object.entries(expected || {})) {
+    if ((delta[k] || 0) < Number(need)) return false;
+  }
+  return true;
+}
+
+// --------- HELPERS ----------
+function makeCode(username) {
+  const base = String(username || "ACC").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4).padEnd(3, "X");
+  const rand = String(Math.floor(1000 + Math.random() * 9000));
+  return "U" + base + rand;
+}
+
+// --- pricing helper
+async function computePriceFromRate(agePots) {
+  const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
+  const rate = Math.max(1, Number(r.rows[0]?.value || 80));
+  return Math.ceil(Number(agePots || 0) / rate);
+}
+
 // --------- DB INIT ----------
 async function initDb() {
   await pool.query(`
@@ -288,6 +336,7 @@ async function initDb() {
     );
   }
 }
+
 
 // ================= AUTH =================
 app.post("/api/auth/register", async (req, res) => {
