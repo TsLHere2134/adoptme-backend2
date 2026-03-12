@@ -887,8 +887,13 @@ app.post("/inventory.php", requireInventoryKey, handleInventoryIngest);
 // ================= LEADERBOARD + MY ACCOUNTS =================
 app.get("/api/leaderboard", async (req, res) => {
   const rows = await pool.query(`
-    select product_code, sum(qty)::int as buys
-    from order_items group by product_code order by buys desc limit 20
+    select u.username, sum(o.total_int)::bigint as total_spent, count(o.id)::int as order_count
+    from orders o
+    join users_local u on u.id = o.user_id
+    where o.status = 'completed'
+    group by u.username
+    order by total_spent desc
+    limit 20
   `);
   res.json({ ok: true, leaderboard: rows.rows });
 });
