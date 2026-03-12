@@ -901,6 +901,52 @@ app.get("/api/my-accounts", requireAuth, async (req, res) => {
   res.json({ ok: true, orders: rows.rows });
 });
 
+// ================= USER: DELETE OWN ORDERS =================
+// Delete a single order (user can only delete their own)
+app.delete("/api/my-accounts/:orderId", requireAuth, async (req, res) => {
+  const orderId = Number(req.params.orderId);
+  if (!orderId || Number.isNaN(orderId)) {
+    return res.status(400).json({ ok: false, error: "invalid order id" });
+  }
+
+  // Verify the order belongs to this user before deleting
+  const check = await pool.query(
+    `select id from orders where id=$1 and user_id=$2`,
+    [orderId, req.user.id]
+  );
+  if (!check.rows[0]) {
+    return res.status(404).json({ ok: false, error: "order not found" });
+  }
+
+  await pool.query(`delete from order_items where order_id=$1`, [orderId]);
+  await pool.query(`delete from orders where id=$1 and user_id=$2`, [orderId, req.user.id]);
+
+  res.json({ ok: true, deleted: orderId });
+});
+
+// Delete ALL orders for the logged-in user at once
+app.delete("/api/my-accounts", requireAuth, async (req, res) => {
+  // Fetch all order ids for this user first (need them to clean order_items)
+  const ids = await pool.query(
+    `select id from orders where user_id=$1`,
+    [req.user.id]
+  );
+  const orderIds = ids.rows.map(r => r.id);
+
+  if (orderIds.length) {
+    await pool.query(
+      `delete from order_items where order_id = any($1::bigint[])`,
+      [orderIds]
+    );
+    await pool.query(
+      `delete from orders where user_id=$1`,
+      [req.user.id]
+    );
+  }
+
+  res.json({ ok: true, deleted: orderIds.length });
+});
+
 // ================= ADMIN: CUSTOMER ORDERS =================
 app.get("/api/admin/orders/user/:username", requireAuth, requireAdmin, async (req, res) => {
   const username = req.params.username;
@@ -955,3 +1001,4 @@ process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", er
 initDb()
   .then(() => console.log("✅ DB ready"))
   .catch((e) => console.error("❌ DB init error (server still running):", e?.message || e));
+OK: replaced once
