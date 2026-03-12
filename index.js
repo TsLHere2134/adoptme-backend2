@@ -1001,4 +1001,3 @@ process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", er
 initDb()
   .then(() => console.log("✅ DB ready"))
   .catch((e) => console.error("❌ DB init error (server still running):", e?.message || e));
-OK: replaced once
