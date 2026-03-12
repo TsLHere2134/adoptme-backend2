@@ -277,7 +277,7 @@ async function initDb() {
 
   await pool.query(`
     insert into settings (key,value)
-    values ('rate_agepots_per_token','80')
+    values ('rate_agepots_per_token','70')
     on conflict (key) do nothing;
   `);
 
