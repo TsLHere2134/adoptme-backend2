@@ -135,7 +135,7 @@ function makeCode(username) {
 // --- pricing helper
 async function computePriceFromRate(agePots) {
   const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
-  const rate = Math.max(1, Number(r.rows[0]?.value || 80));
+  const rate = Math.max(1, Number(r.rows[0]?.value || 70));
   return Math.ceil(Number(agePots || 0) / rate);
 }
 
