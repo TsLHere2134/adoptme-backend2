@@ -45,7 +45,6 @@ app.use((req, res, next) => {
 // ✅ Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway Postgres typically needs SSL; this works for Railway.
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
@@ -142,7 +141,6 @@ async function computePriceFromRate(agePots) {
 
 // --------- DB INIT ----------
 async function initDb() {
-  // ✅ Create tables
   await pool.query(`
     create table if not exists users_local (
       id bigserial primary key,
@@ -208,7 +206,7 @@ async function initDb() {
       expected jsonb not null,
       points_to_credit bigint not null,
       receiver_account text not null,
-      status text not null default 'pending',  -- pending | matched | expired
+      status text not null default 'pending',
       created_at timestamptz not null default now(),
       expires_at timestamptz,
       matched_at timestamptz,
@@ -251,25 +249,21 @@ async function initDb() {
     alter table account_credentials add column if not exists age_pots int not null default 0;
     alter table account_credentials add column if not exists bucks int not null default 0;
 
-    -- inventory_snapshots columns (in case old table existed)
     alter table inventory_snapshots add column if not exists delta jsonb not null default '{}'::jsonb;
     alter table inventory_snapshots add column if not exists receiver_account text not null default 'unknown';
     alter table inventory_snapshots add column if not exists received_at timestamptz not null default now();
 
-    -- ✅ 45-minute expiry support
     alter table expected_payments add column if not exists expires_at timestamptz;
     alter table expected_payments add column if not exists matched_at timestamptz;
     alter table expected_payments add column if not exists matched_snapshot_id bigint;
   `);
 
-  // backfill expires_at for old rows if missing
   await pool.query(`
     update expected_payments
     set expires_at = created_at + interval '45 minutes'
     where expires_at is null
   `);
 
-  // Drop the bad unique constraint on product_code if it exists (allows multiple creds per product)
   await pool.query(`
     do $$ begin
       if exists (
@@ -389,7 +383,6 @@ app.post("/api/admin/settings", requireAdminKey, async (req, res) => {
 
 // ================= PRODUCTS =================
 app.get("/api/products", async (req, res) => {
-  // ✅ Safer GROUP BY to avoid strict Postgres complaints
   const rows = await pool.query(`
     select
       p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
@@ -504,6 +497,80 @@ app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, re
   res.json({ ok: true, credential: r.rows[0] });
 });
 
+app.get("/api/admin/credentials/:code", requireAuth, requireAdmin, async (req, res) => {
+  const code = req.params.code;
+  const r = await pool.query(
+    `select id, product_code, roblox_user, roblox_pass, note, age_pots, bucks, assigned_order_id, created_at
+     from account_credentials where product_code=$1 order by id asc`,
+    [code]
+  );
+  res.json({ ok: true, credentials: r.rows });
+});
+
+app.post("/api/admin/credentials/delete", requireAuth, requireAdmin, async (req, res) => {
+  const id = Number(req.body?.id);
+  if (!id) return res.status(400).json({ ok: false, error: "id required" });
+  await pool.query(`delete from account_credentials where id=$1`, [id]);
+  res.json({ ok: true });
+});
+
+// ================= ADMIN: MASS IMPORT ✅ NEW =================
+app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req, res) => {
+  const csv = String(req.body?.csv || "").trim();
+  if (!csv) return res.status(400).json({ ok: false, error: "csv required" });
+
+  const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
+  let inserted = 0, skipped = 0;
+  const products = [];
+
+  for (const line of lines) {
+    const parts = line.split(",");
+    if (parts.length < 4) { skipped++; continue; }
+
+    const [roblox_user_raw, roblox_pass_raw, age_pots_raw, bucks_raw, ...noteParts] = parts;
+    const roblox_user = roblox_user_raw?.trim();
+    const roblox_pass = roblox_pass_raw?.trim();
+    const note = noteParts.join(",").trim();
+    const age_pots = Math.max(0, Number(age_pots_raw?.trim() || 0));
+    const bucks = Math.max(0, Number(bucks_raw?.trim() || 0));
+
+    if (!roblox_user || !roblox_pass) { skipped++; continue; }
+
+    // Censored display title: first char + asterisks
+    const censored = roblox_user[0] + "*".repeat(Math.max(1, roblox_user.length - 1));
+    const price_int = await computePriceFromRate(age_pots);
+    const code = makeCode(roblox_user);
+
+    try {
+      // Upsert the product listing
+      await pool.query(`
+        insert into products (code, title, kind, age_pots, bucks, price_int, stock_int, note, sold)
+        values ($1, $2, 'account', $3, $4, $5, 1, '', false)
+        on conflict (code) do update set
+          age_pots  = excluded.age_pots,
+          bucks     = excluded.bucks,
+          price_int = excluded.price_int,
+          stock_int = products.stock_int + 1,
+          sold      = false
+      `, [code, censored, age_pots, bucks, price_int]);
+
+      // Insert the credential row
+      await pool.query(`
+        insert into account_credentials (product_code, roblox_user, roblox_pass, note, age_pots, bucks)
+        values ($1, $2, $3, $4, $5, $6)
+      `, [code, roblox_user, roblox_pass, note, age_pots, bucks]);
+
+      products.push(code);
+      inserted++;
+    } catch (e) {
+      console.error("import row error:", e?.message);
+      skipped++;
+    }
+  }
+
+  res.json({ ok: true, inserted, skipped, total: lines.length, products });
+});
+
 // ================= ORDERS =================
 app.post("/api/orders/create", requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
@@ -562,34 +629,28 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       const qty = Math.max(1, Number(item.qty || 1));
 
       await client.query(
-        `
-        update products
-        set stock_int       = GREATEST(0, stock_int - $1),
-            purchases_count = purchases_count + $1
-        where code = $2
-      `,
+        `update products
+         set stock_int       = GREATEST(0, stock_int - $1),
+             purchases_count = purchases_count + $1
+         where code = $2`,
         [qty, code]
       );
 
       await client.query(
-        `
-        update products
-        set sold    = (stock_int <= 0),
-            sold_at = case when stock_int <= 0 then now() else sold_at end
-        where code = $1
-      `,
+        `update products
+         set sold    = (stock_int <= 0),
+             sold_at = case when stock_int <= 0 then now() else sold_at end
+         where code = $1`,
         [code]
       );
 
       const cred = await client.query(
-        `
-        select id, roblox_user, roblox_pass, note, age_pots, bucks
-        from account_credentials
-        where product_code = $1 and assigned_order_id is null
-        order by id asc
-        limit 1
-        for update skip locked
-      `,
+        `select id, roblox_user, roblox_pass, note, age_pots, bucks
+         from account_credentials
+         where product_code = $1 and assigned_order_id is null
+         order by id asc
+         limit 1
+         for update skip locked`,
         [code]
       );
 
@@ -605,8 +666,6 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
           age_pots: cred.rows[0].age_pots,
           bucks: cred.rows[0].bucks,
         };
-
-        // temporary lock marker so another purchase doesn't take it in this txn
         await client.query(`update account_credentials set assigned_order_id=-1 where id=$1`, [credId]);
       }
 
@@ -614,11 +673,9 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
     }
 
     const created = await client.query(
-      `
-      insert into orders (user_id, cart, total_int, status)
-      values ($1::bigint,$2,$3,'completed')
-      returning id, status, total_int, created_at
-    `,
+      `insert into orders (user_id, cart, total_int, status)
+       values ($1::bigint,$2,$3,'completed')
+       returning id, status, total_int, created_at`,
       [
         req.user.id,
         JSON.stringify(enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials }))),
@@ -756,37 +813,31 @@ async function handleInventoryIngest(req, res) {
   const receiver_account = String(req.body?.receiver_account || req.body?.user || "unknown");
   const snapshot = req.body;
 
-  // Get previous snapshot
   const last = await pool.query(
     `select data from inventory_snapshots where receiver_account=$1 order by id desc limit 1`,
     [receiver_account]
   );
   const prev = last.rows[0]?.data || null;
 
-  // compute delta (only positive increases)
   const delta = deltaCounts(prev ? countFromSnapshot(prev) : {}, countFromSnapshot(snapshot));
 
-  // store snapshot + delta
   const snapIns = await pool.query(
     `insert into inventory_snapshots (receiver_account,data,delta) values ($1,$2,$3) returning id, received_at`,
     [receiver_account, JSON.stringify(snapshot), JSON.stringify(delta)]
   );
   const snapshotId = snapIns.rows[0].id;
 
-  // match + credit in a transaction with row locks
   const client = await pool.connect();
   const matched = [];
   try {
     await client.query("BEGIN");
 
-    // expire old ones (cheap safety)
     await client.query(`
       update expected_payments
       set status='expired'
       where status='pending' and expires_at <= now()
     `);
 
-    // lock pending expected payments for this receiver (oldest first)
     const pending = await client.query(
       `select id,user_id,expected,points_to_credit,expires_at
        from expected_payments
@@ -796,7 +847,6 @@ async function handleInventoryIngest(req, res) {
       [receiver_account]
     );
 
-    // Find FIRST one that satisfies this delta (prevents paying multiple off same delta)
     let picked = null;
     for (const p of pending.rows) {
       if (satisfies(delta, p.expected)) {
@@ -844,9 +894,33 @@ app.get("/api/leaderboard", async (req, res) => {
 });
 
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
-  const rows = await pool.query(`select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`, [
-    req.user.id,
-  ]);
+  const rows = await pool.query(
+    `select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`,
+    [req.user.id]
+  );
+  res.json({ ok: true, orders: rows.rows });
+});
+
+// ================= ADMIN: CUSTOMER ORDERS =================
+app.get("/api/admin/orders/user/:username", requireAuth, requireAdmin, async (req, res) => {
+  const username = req.params.username;
+  const u = await pool.query(`select id, username, balance_int from users_local where username=$1`, [username]);
+  if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
+  const orders = await pool.query(
+    `select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`,
+    [u.rows[0].id]
+  );
+  res.json({ ok: true, user: u.rows[0], orders: orders.rows });
+});
+
+app.get("/api/admin/orders", requireAuth, requireAdmin, async (req, res) => {
+  const rows = await pool.query(`
+    select o.id, o.status, o.cart, o.total_int, o.created_at, u.username
+    from orders o
+    left join users_local u on u.id = o.user_id
+    order by o.id desc
+    limit 100
+  `);
   res.json({ ok: true, orders: rows.rows });
 });
 
@@ -875,7 +949,6 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
 });
 
-// ✅ show real crashes in Railway logs
 process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
 process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
