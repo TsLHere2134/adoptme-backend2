@@ -368,11 +368,11 @@ app.get("/api/me", requireAuth, async (req, res) => {
 // ================= SETTINGS =================
 app.get("/api/settings", async (req, res) => {
   const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
-  res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 80) });
+  res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 70) });
 });
 
 app.post("/api/admin/settings", requireAdminKey, async (req, res) => {
-  const rate = Math.max(1, Number(req.body?.rate_agepots_per_token || 80));
+  const rate = Math.max(1, Number(req.body?.rate_agepots_per_token || 70));
   await pool.query(
     `insert into settings(key,value) values('rate_agepots_per_token',$1)
      on conflict(key) do update set value=excluded.value`,
