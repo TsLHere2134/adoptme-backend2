@@ -854,6 +854,11 @@ app.get("/api/leaderboard", async (req, res) => {
   res.json({ ok: true, leaderboard: rows.rows });
 });
 
+app.get("/api/member-count", async (req, res) => {
+  const r = await pool.query(`select count(*)::int as count from users_local`);
+  res.json({ ok: true, count: r.rows[0]?.count ?? 0 });
+});
+
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
   const rows = await pool.query(`select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`, [req.user.id]);
   res.json({ ok: true, orders: rows.rows });
