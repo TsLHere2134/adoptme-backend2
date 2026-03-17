@@ -1,18 +1,47 @@
 // server.js  (or index.js)
-// NOTE: If you use `import ...` like this, make sure package.json has: { "type": "module" }
+// ESM version — package.json should include: { "type": "module" }
 
 import express from "express";
 import { Pool } from "pg";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 const app = express();
+
+// ===== REQUIRED ENV =====
+if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required");
+if (!process.env.ADMIN_KEY) throw new Error("ADMIN_KEY is required");
+if (!process.env.INVENTORY_API_KEY) throw new Error("INVENTORY_API_KEY is required");
+if (!process.env.CREDENTIALS_ENCRYPTION_KEY) {
+  throw new Error("CREDENTIALS_ENCRYPTION_KEY is required");
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_KEY = process.env.ADMIN_KEY;
+const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
+
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const ENC_KEY = crypto
+  .createHash("sha256")
+  .update(process.env.CREDENTIALS_ENCRYPTION_KEY)
+  .digest();
+
+// ===== BASIC APP =====
+app.set("trust proxy", 1);
 
 // ✅ Health FIRST (Railway loves this)
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 app.get("/", (req, res) => res.status(200).send("API running ✅"));
 
-app.use(express.json({ limit: "5mb" }));
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
 
 // ✅ Catch malformed JSON bodies — returns JSON instead of HTML 400
 app.use((err, req, res, next) => {
@@ -23,15 +52,21 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// --- CORS: reflect origin so adoptmehub.com and dev both work
+// --- CORS allowlist
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin) {
+
+  if (origin && FRONTEND_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key");
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, x-inventory-key, x-admin-key"
+  );
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -42,25 +77,74 @@ app.use((req, res, next) => {
   next();
 });
 
+// ===== RATE LIMITERS =====
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const orderLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const inventoryLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const adminLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ✅ Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
-const ADMIN_KEY = process.env.ADMIN_KEY || "";
-const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY || "";
+// --------- CRYPTO HELPERS ----------
+function encryptText(text) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", ENC_KEY, iv);
+  let encrypted = cipher.update(String(text), "utf8", "hex");
+  encrypted += cipher.final("hex");
+  return `${iv.toString("hex")}:${encrypted}`;
+}
+
+function decryptText(value) {
+  try {
+    const raw = String(value || "");
+    const [ivHex, encrypted] = raw.split(":");
+    if (!ivHex || !encrypted) return raw; // fallback for older plaintext rows
+    const iv = Buffer.from(ivHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", ENC_KEY, iv);
+    let decrypted = decipher.update(encrypted, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return decrypted;
+  } catch {
+    return String(value || "");
+  }
+}
 
 // --------- AUTH HELPERS ----------
 function requireAdminKey(req, res, next) {
-  if (!ADMIN_KEY) return res.status(500).json({ ok: false, error: "ADMIN_KEY not set" });
-  if (req.header("x-admin-key") !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "bad admin key" });
+  if (req.header("x-admin-key") !== ADMIN_KEY) {
+    return res.status(401).json({ ok: false, error: "bad admin key" });
+  }
   next();
 }
 
 function requireInventoryKey(req, res, next) {
-  if (!INVENTORY_API_KEY) return res.status(500).json({ ok: false, error: "INVENTORY_API_KEY not set" });
   if (req.header("x-inventory-key") !== INVENTORY_API_KEY) {
     return res.status(401).json({ ok: false, error: "bad inventory key" });
   }
@@ -71,10 +155,13 @@ function requireAuth(req, res, next) {
   const auth = req.header("Authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   if (!token) return res.status(401).json({ ok: false, error: "missing token" });
+
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     payload.id = Number(payload.id);
-    if (!payload.id || Number.isNaN(payload.id)) return res.status(401).json({ ok: false, error: "invalid token payload" });
+    if (!payload.id || Number.isNaN(payload.id)) {
+      return res.status(401).json({ ok: false, error: "invalid token payload" });
+    }
     req.user = payload;
     next();
   } catch {
@@ -233,6 +320,15 @@ async function initDb() {
       assigned_at timestamptz,
       created_at timestamptz not null default now()
     );
+
+    create table if not exists token_ledger (
+      id bigserial primary key,
+      user_id bigint references users_local(id),
+      delta bigint not null,
+      reason text not null,
+      meta jsonb not null default '{}'::jsonb,
+      created_at timestamptz not null default now()
+    );
   `);
 
   // ✅ MIGRATIONS — safe to run every boot
@@ -287,16 +383,34 @@ async function initDb() {
       [i]
     );
   }
+
+  // Encrypt old plaintext credentials on startup
+  const creds = await pool.query(`select id, roblox_pass from account_credentials`);
+  for (const row of creds.rows) {
+    const val = String(row.roblox_pass || "");
+    if (val && !val.includes(":")) {
+      await pool.query(
+        `update account_credentials set roblox_pass=$1 where id=$2`,
+        [encryptText(val), row.id]
+      );
+    }
+  }
 }
 
 // ================= AUTH =================
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const username = String(req.body?.username || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
-  if (username.length < 3) return res.status(400).json({ ok: false, error: "username too short" });
-  if (password.length < 6) return res.status(400).json({ ok: false, error: "password too short (min 6)" });
+
+  if (username.length < 3) {
+    return res.status(400).json({ ok: false, error: "username too short" });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ ok: false, error: "password too short (min 6)" });
+  }
 
   const hash = await bcrypt.hash(password, 10);
+
   try {
     const ins = await pool.query(
       `insert into users_local (username,password_hash) values ($1,$2)
@@ -304,22 +418,27 @@ app.post("/api/auth/register", async (req, res) => {
       [username, hash]
     );
     const user = ins.rows[0];
-    const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, {
-      expiresIn: "30d",
-    });
+    const token = jwt.sign(
+      { id: user.id, username: user.username, is_admin: user.is_admin },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
     res.json({ ok: true, token, user });
   } catch {
     res.status(400).json({ ok: false, error: "username already used" });
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const username = String(req.body?.username || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
+
   const u = await pool.query(
-    `select id,username,password_hash,balance_int,is_admin,is_blacklisted,created_at from users_local where username=$1`,
+    `select id,username,password_hash,balance_int,is_admin,is_blacklisted,created_at
+     from users_local where username=$1`,
     [username]
   );
+
   if (!u.rows[0]) return res.status(401).json({ ok: false, error: "bad login" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
 
@@ -347,9 +466,11 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const u = await pool.query(
-    `select id,username,balance_int,is_admin,is_blacklisted,created_at from users_local where id=$1`,
+    `select id,username,balance_int,is_admin,is_blacklisted,created_at
+     from users_local where id=$1`,
     [req.user.id]
   );
+
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
 
@@ -371,7 +492,7 @@ app.get("/api/settings", async (req, res) => {
   res.json({ ok: true, rate_agepots_per_token: Number(r.rows[0]?.value || 70) });
 });
 
-app.post("/api/admin/settings", requireAdminKey, async (req, res) => {
+app.post("/api/admin/settings", adminLimiter, requireAdminKey, async (req, res) => {
   const rate = Math.max(1, Number(req.body?.rate_agepots_per_token || 70));
   await pool.query(
     `insert into settings(key,value) values('rate_agepots_per_token',$1)
@@ -399,41 +520,76 @@ app.get("/api/products", async (req, res) => {
 });
 
 // ================= JWT ADMIN: USERS =================
-app.post("/api/admin/users/balance", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/users/balance", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const username = String(req.body?.username || "").trim();
   const delta = Number(req.body?.delta || 0);
+
   if (!username || !Number.isFinite(delta)) {
     return res.status(400).json({ ok: false, error: "username + numeric delta required" });
   }
 
-  const q = await pool.query(
-    `update users_local set balance_int = GREATEST(0, balance_int + $1) where username=$2
-     returning id,username,balance_int,is_blacklisted,is_admin`,
-    [Math.trunc(delta), username]
-  );
-  if (!q.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
-  res.json({ ok: true, user: q.rows[0] });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const q = await client.query(
+      `update users_local
+       set balance_int = GREATEST(0, balance_int + $1)
+       where username=$2
+       returning id,username,balance_int,is_blacklisted,is_admin`,
+      [Math.trunc(delta), username]
+    );
+
+    if (!q.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "user not found" });
+    }
+
+    await client.query(
+      `insert into token_ledger (user_id, delta, reason, meta)
+       values ($1,$2,'admin_balance_adjust',$3::jsonb)`,
+      [
+        q.rows[0].id,
+        Math.trunc(delta),
+        JSON.stringify({ admin_id: req.user.id, username }),
+      ]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, user: q.rows[0] });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("admin/users/balance error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "balance update failed" });
+  } finally {
+    client.release();
+  }
 });
 
-app.post("/api/admin/users/blacklist", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/users/blacklist", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const username = String(req.body?.username || "").trim();
   const value = !!req.body?.value;
   if (!username) return res.status(400).json({ ok: false, error: "username required" });
 
   const q = await pool.query(
-    `update users_local set is_blacklisted=$1 where username=$2 returning id,username,is_blacklisted`,
+    `update users_local set is_blacklisted=$1 where username=$2
+     returning id,username,is_blacklisted`,
     [value, username]
   );
+
   if (!q.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   res.json({ ok: true, user: q.rows[0] });
 });
 
 // ================= JWT ADMIN: PRODUCTS =================
-app.post("/api/admin/products/upsert", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/products/upsert", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const p = req.body || {};
   const code = String(p.code || "").trim();
   const title = String(p.title || "").trim();
-  if (!code || !title) return res.status(400).json({ ok: false, error: "code + title required" });
+
+  if (!code || !title) {
+    return res.status(400).json({ ok: false, error: "code + title required" });
+  }
 
   const price_int = Math.max(0, Math.trunc(Number(p.price_int || 0)));
   const stock_int = Math.max(0, Math.trunc(Number(p.stock_int ?? 1)));
@@ -459,14 +615,14 @@ app.post("/api/admin/products/upsert", requireAuth, requireAdmin, async (req, re
       image_url=excluded.image_url,
       sold=excluded.sold
     returning *;
-  `,
+    `,
     [code, title, kind, age_pots, bucks, price_int, stock_int, note, image_url, sold]
   );
 
   res.json({ ok: true, product: q.rows[0] });
 });
 
-app.post("/api/admin/products/delete", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/products/delete", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const code = String(req.body?.code || "").trim();
   if (!code) return res.status(400).json({ ok: false, error: "code required" });
   await pool.query(`delete from products where code=$1`, [code]);
@@ -474,7 +630,7 @@ app.post("/api/admin/products/delete", requireAuth, requireAdmin, async (req, re
 });
 
 // ================= ADMIN: CREDENTIALS =================
-app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/credentials/add", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const product_code = String(req.body?.product_code || "").trim();
   const roblox_user = String(req.body?.roblox_user || "").trim();
   const roblox_pass = String(req.body?.roblox_pass || "").trim();
@@ -483,49 +639,71 @@ app.post("/api/admin/credentials/add", requireAuth, requireAdmin, async (req, re
   const bucks = Math.max(0, Number(req.body?.bucks || 0));
 
   if (!product_code || !roblox_user || !roblox_pass) {
-    return res.status(400).json({ ok: false, error: "product_code, roblox_user, roblox_pass required" });
+    return res.status(400).json({
+      ok: false,
+      error: "product_code, roblox_user, roblox_pass required",
+    });
   }
+
+  const encryptedPass = encryptText(roblox_pass);
 
   const r = await pool.query(
     `insert into account_credentials (product_code,roblox_user,roblox_pass,note,age_pots,bucks)
      values ($1,$2,$3,$4,$5,$6)
      returning id,product_code,roblox_user,assigned_order_id,created_at`,
-    [product_code, roblox_user, roblox_pass, note, age_pots, bucks]
+    [product_code, roblox_user, encryptedPass, note, age_pots, bucks]
   );
 
-  await pool.query(`update products set stock_int = stock_int + 1, sold = false where code=$1`, [product_code]);
+  await pool.query(`update products set stock_int = stock_int + 1, sold = false where code=$1`, [
+    product_code,
+  ]);
+
   res.json({ ok: true, credential: r.rows[0] });
 });
 
-app.get("/api/admin/credentials/:code", requireAuth, requireAdmin, async (req, res) => {
+app.get("/api/admin/credentials/:code", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const code = req.params.code;
   const r = await pool.query(
-    `select id, product_code, roblox_user, roblox_pass, note, age_pots, bucks, assigned_order_id, created_at
-     from account_credentials where product_code=$1 order by id asc`,
+    `select id, product_code, roblox_user, roblox_pass, note, age_pots, bucks,
+            assigned_order_id, created_at
+     from account_credentials
+     where product_code=$1
+     order by id asc`,
     [code]
   );
-  res.json({ ok: true, credentials: r.rows });
+
+  res.json({
+    ok: true,
+    credentials: r.rows.map((row) => ({
+      ...row,
+      roblox_pass: decryptText(row.roblox_pass),
+    })),
+  });
 });
 
-app.post("/api/admin/credentials/delete", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/admin/credentials/delete", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const id = Number(req.body?.id);
   if (!id) return res.status(400).json({ ok: false, error: "id required" });
   await pool.query(`delete from account_credentials where id=$1`, [id]);
   res.json({ ok: true });
 });
 
-// ================= ADMIN: MASS IMPORT ✅ NEW =================
-app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req, res) => {
+// ================= ADMIN: MASS IMPORT =================
+app.post("/api/admin/credentials/import", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const csv = String(req.body?.csv || "").trim();
   if (!csv) return res.status(400).json({ ok: false, error: "csv required" });
 
-  const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
-  let inserted = 0, skipped = 0;
+  const lines = csv.split("\n").map((l) => l.trim()).filter(Boolean);
+  let inserted = 0;
+  let skipped = 0;
   const products = [];
 
   for (const line of lines) {
     const parts = line.split(",");
-    if (parts.length < 4) { skipped++; continue; }
+    if (parts.length < 4) {
+      skipped++;
+      continue;
+    }
 
     const [roblox_user_raw, roblox_pass_raw, age_pots_raw, bucks_raw, ...noteParts] = parts;
     const roblox_user = roblox_user_raw?.trim();
@@ -534,16 +712,18 @@ app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req,
     const age_pots = Math.max(0, Number(age_pots_raw?.trim() || 0));
     const bucks = Math.max(0, Number(bucks_raw?.trim() || 0));
 
-    if (!roblox_user || !roblox_pass) { skipped++; continue; }
+    if (!roblox_user || !roblox_pass) {
+      skipped++;
+      continue;
+    }
 
-    // Censored display title: first char + asterisks
     const censored = roblox_user[0] + "*".repeat(Math.max(1, roblox_user.length - 1));
     const price_int = await computePriceFromRate(age_pots);
     const code = makeCode(roblox_user);
 
     try {
-      // Upsert the product listing
-      await pool.query(`
+      await pool.query(
+        `
         insert into products (code, title, kind, age_pots, bucks, price_int, stock_int, note, sold)
         values ($1, $2, 'account', $3, $4, $5, 1, '', false)
         on conflict (code) do update set
@@ -552,13 +732,17 @@ app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req,
           price_int = excluded.price_int,
           stock_int = products.stock_int + 1,
           sold      = false
-      `, [code, censored, age_pots, bucks, price_int]);
+        `,
+        [code, censored, age_pots, bucks, price_int]
+      );
 
-      // Insert the credential row
-      await pool.query(`
+      await pool.query(
+        `
         insert into account_credentials (product_code, roblox_user, roblox_pass, note, age_pots, bucks)
         values ($1, $2, $3, $4, $5, $6)
-      `, [code, roblox_user, roblox_pass, note, age_pots, bucks]);
+        `,
+        [code, roblox_user, encryptText(roblox_pass), note, age_pots, bucks]
+      );
 
       products.push(code);
       inserted++;
@@ -572,7 +756,7 @@ app.post("/api/admin/credentials/import", requireAuth, requireAdmin, async (req,
 });
 
 // ================= ORDERS =================
-app.post("/api/orders/create", requireAuth, async (req, res) => {
+app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
 
@@ -583,9 +767,13 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
     const codes = [...new Set(cart.map((i) => String(i.code || "")))];
 
     const prods = await client.query(
-      `select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`,
+      `select code, price_int, stock_int, sold
+       from products
+       where code = any($1::text[])
+       for update`,
       [codes]
     );
+
     const map = new Map(prods.rows.map((p) => [p.code, p]));
 
     let total = 0;
@@ -605,13 +793,17 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       total += Number(p.price_int) * qty;
     }
 
-    const userRow = await client.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
+    const userRow = await client.query(
+      `select id, balance_int from users_local where id=$1 for update`,
+      [req.user.id]
+    );
     const user = userRow.rows[0];
 
     if (!user) {
       await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "user not found" });
     }
+
     if (Number(user.balance_int) < total) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -620,7 +812,16 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       });
     }
 
-    await client.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [total, req.user.id]);
+    await client.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [
+      total,
+      req.user.id,
+    ]);
+
+    await client.query(
+      `insert into token_ledger (user_id, delta, reason, meta)
+       values ($1,$2,'purchase',$3::jsonb)`,
+      [req.user.id, -total, JSON.stringify({ cart })]
+    );
 
     const enrichedCart = [];
 
@@ -661,7 +862,7 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
         credId = cred.rows[0].id;
         credentials = {
           user: cred.rows[0].roblox_user,
-          pass: cred.rows[0].roblox_pass,
+          pass: decryptText(cred.rows[0].roblox_pass),
           note: cred.rows[0].note,
           age_pots: cred.rows[0].age_pots,
           bucks: cred.rows[0].bucks,
@@ -678,7 +879,13 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
        returning id, status, total_int, created_at`,
       [
         req.user.id,
-        JSON.stringify(enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials }))),
+        JSON.stringify(
+          enrichedCart.map((i) => ({
+            code: i.code,
+            qty: i.qty,
+            credentials: i.credentials,
+          }))
+        ),
         total,
       ]
     );
@@ -692,11 +899,11 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
           [orderId, item._credId]
         );
       }
-      await client.query(`insert into order_items(order_id,product_code,qty) values($1,$2,$3)`, [
-        orderId,
-        item.code,
-        item.qty,
-      ]);
+
+      await client.query(
+        `insert into order_items(order_id,product_code,qty) values($1,$2,$3)`,
+        [orderId, item.code, item.qty]
+      );
     }
 
     await client.query("COMMIT");
@@ -705,13 +912,17 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
       ok: true,
       order: {
         ...created.rows[0],
-        cart: enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials })),
+        cart: enrichedCart.map((i) => ({
+          code: i.code,
+          qty: i.qty,
+          credentials: i.credentials,
+        })),
       },
     });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("orders/create error:", err?.message || err);
-    res.status(500).json({ ok: false, error: "Order failed: " + (err?.message || "server error") });
+    res.status(500).json({ ok: false, error: "order failed" });
   } finally {
     client.release();
   }
@@ -720,12 +931,14 @@ app.post("/api/orders/create", requireAuth, async (req, res) => {
 // ================= PAYMENT SLOTS =================
 app.get("/api/payment-slots", async (req, res) => {
   const rows = await pool.query(
-    `select slot,title,item_key,points_per_unit,image_url,enabled from payment_slots order by slot asc`
+    `select slot,title,item_key,points_per_unit,image_url,enabled
+     from payment_slots
+     order by slot asc`
   );
   res.json({ ok: true, slots: rows.rows });
 });
 
-app.post("/api/admin/payment-slots/set", requireAdminKey, async (req, res) => {
+app.post("/api/admin/payment-slots/set", adminLimiter, requireAdminKey, async (req, res) => {
   const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
   const title = String(req.body?.title || "");
   const item_key = String(req.body?.item_key || "");
@@ -734,7 +947,9 @@ app.post("/api/admin/payment-slots/set", requireAdminKey, async (req, res) => {
   const enabled = Boolean(req.body?.enabled);
 
   await pool.query(
-    `update payment_slots set title=$2,item_key=$3,points_per_unit=$4,image_url=$5,enabled=$6 where slot=$1`,
+    `update payment_slots
+     set title=$2,item_key=$3,points_per_unit=$4,image_url=$5,enabled=$6
+     where slot=$1`,
     [slot, title, item_key, points_per_unit, image_url, enabled]
   );
   res.json({ ok: true });
@@ -757,10 +972,18 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const slot = Math.min(15, Math.max(1, Number(req.body?.slot)));
   const qty = Math.max(1, Number(req.body?.qty || 1));
-  if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
 
-  const s = await pool.query(`select enabled,item_key,points_per_unit from payment_slots where slot=$1`, [slot]);
-  if (!s.rows[0] || !s.rows[0].enabled) return res.status(400).json({ ok: false, error: "slot disabled" });
+  if (!receiver_account) {
+    return res.status(400).json({ ok: false, error: "receiver_account required" });
+  }
+
+  const s = await pool.query(`select enabled,item_key,points_per_unit from payment_slots where slot=$1`, [
+    slot,
+  ]);
+
+  if (!s.rows[0] || !s.rows[0].enabled) {
+    return res.status(400).json({ ok: false, error: "slot disabled" });
+  }
 
   const item_key = String(s.rows[0].item_key || "").trim();
   if (!item_key) return res.status(400).json({ ok: false, error: "slot has empty item_key" });
@@ -768,14 +991,25 @@ app.post("/api/payments/expect-slot", requireAuth, async (req, res) => {
   const points = Number(s.rows[0].points_per_unit) * qty;
   const expected = { [item_key]: qty };
 
-  const expected_payment = await createExpectedPayment(req.user.id, "slot", expected, points, receiver_account);
+  const expected_payment = await createExpectedPayment(
+    req.user.id,
+    "slot",
+    expected,
+    points,
+    receiver_account
+  );
+
   res.json({ ok: true, expected_payment, expected, points });
 });
 
 app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
   const receiver_account = String(req.body?.receiver_account || "").trim();
   const items = req.body?.items || {};
-  if (!receiver_account) return res.status(400).json({ ok: false, error: "receiver_account required" });
+
+  if (!receiver_account) {
+    return res.status(400).json({ ok: false, error: "receiver_account required" });
+  }
+
   if (!items || typeof items !== "object" || Array.isArray(items)) {
     return res.status(400).json({ ok: false, error: "items object required" });
   }
@@ -793,7 +1027,10 @@ app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
 
     const slotRow = byKey.get(key);
     if (!slotRow || !slotRow.enabled) {
-      return res.status(400).json({ ok: false, error: `slot disabled or unknown item_key: ${key}` });
+      return res.status(400).json({
+        ok: false,
+        error: `slot disabled or unknown item_key: ${key}`,
+      });
     }
 
     expected[key] = qty;
@@ -804,7 +1041,14 @@ app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
     return res.status(400).json({ ok: false, error: "no valid items selected" });
   }
 
-  const expected_payment = await createExpectedPayment(req.user.id, "multi", expected, totalPoints, receiver_account);
+  const expected_payment = await createExpectedPayment(
+    req.user.id,
+    "multi",
+    expected,
+    totalPoints,
+    receiver_account
+  );
+
   res.json({ ok: true, expected_payment, expected, points: totalPoints });
 });
 
@@ -817,18 +1061,22 @@ async function handleInventoryIngest(req, res) {
     `select data from inventory_snapshots where receiver_account=$1 order by id desc limit 1`,
     [receiver_account]
   );
-  const prev = last.rows[0]?.data || null;
 
+  const prev = last.rows[0]?.data || null;
   const delta = deltaCounts(prev ? countFromSnapshot(prev) : {}, countFromSnapshot(snapshot));
 
   const snapIns = await pool.query(
-    `insert into inventory_snapshots (receiver_account,data,delta) values ($1,$2,$3) returning id, received_at`,
+    `insert into inventory_snapshots (receiver_account,data,delta)
+     values ($1,$2,$3)
+     returning id, received_at`,
     [receiver_account, JSON.stringify(snapshot), JSON.stringify(delta)]
   );
+
   const snapshotId = snapIns.rows[0].id;
 
   const client = await pool.connect();
   const matched = [];
+
   try {
     await client.query("BEGIN");
 
@@ -862,11 +1110,30 @@ async function handleInventoryIngest(req, res) {
          where id=$1`,
         [picked.id, snapshotId]
       );
+
       await client.query(`update users_local set balance_int = balance_int + $1 where id=$2`, [
         Number(picked.points_to_credit),
         picked.user_id,
       ]);
-      matched.push({ expected_payment_id: picked.id, credited: Number(picked.points_to_credit) });
+
+      await client.query(
+        `insert into token_ledger (user_id, delta, reason, meta)
+         values ($1,$2,'inventory_payment_match',$3::jsonb)`,
+        [
+          picked.user_id,
+          Number(picked.points_to_credit),
+          JSON.stringify({
+            expected_payment_id: picked.id,
+            snapshot_id: snapshotId,
+            receiver_account,
+          }),
+        ]
+      );
+
+      matched.push({
+        expected_payment_id: picked.id,
+        credited: Number(picked.points_to_credit),
+      });
     }
 
     await client.query("COMMIT");
@@ -881,8 +1148,8 @@ async function handleInventoryIngest(req, res) {
   res.json({ ok: true, receiver_account, snapshot_id: snapshotId, delta, matched });
 }
 
-app.post("/inventory", requireInventoryKey, handleInventoryIngest);
-app.post("/inventory.php", requireInventoryKey, handleInventoryIngest);
+app.post("/inventory", inventoryLimiter, requireInventoryKey, handleInventoryIngest);
+app.post("/inventory.php", inventoryLimiter, requireInventoryKey, handleInventoryIngest);
 
 // ================= LEADERBOARD + MY ACCOUNTS =================
 app.get("/api/leaderboard", async (req, res) => {
@@ -900,25 +1167,27 @@ app.get("/api/leaderboard", async (req, res) => {
 
 app.get("/api/my-accounts", requireAuth, async (req, res) => {
   const rows = await pool.query(
-    `select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`,
+    `select id, status, cart, total_int, created_at
+     from orders
+     where user_id=$1
+     order by id desc`,
     [req.user.id]
   );
   res.json({ ok: true, orders: rows.rows });
 });
 
 // ================= USER: DELETE OWN ORDERS =================
-// Delete a single order (user can only delete their own)
 app.delete("/api/my-accounts/:orderId", requireAuth, async (req, res) => {
   const orderId = Number(req.params.orderId);
   if (!orderId || Number.isNaN(orderId)) {
     return res.status(400).json({ ok: false, error: "invalid order id" });
   }
 
-  // Verify the order belongs to this user before deleting
   const check = await pool.query(
     `select id from orders where id=$1 and user_id=$2`,
     [orderId, req.user.id]
   );
+
   if (!check.rows[0]) {
     return res.status(404).json({ ok: false, error: "order not found" });
   }
@@ -929,42 +1198,40 @@ app.delete("/api/my-accounts/:orderId", requireAuth, async (req, res) => {
   res.json({ ok: true, deleted: orderId });
 });
 
-// Delete ALL orders for the logged-in user at once
 app.delete("/api/my-accounts", requireAuth, async (req, res) => {
-  // Fetch all order ids for this user first (need them to clean order_items)
-  const ids = await pool.query(
-    `select id from orders where user_id=$1`,
-    [req.user.id]
-  );
-  const orderIds = ids.rows.map(r => r.id);
+  const ids = await pool.query(`select id from orders where user_id=$1`, [req.user.id]);
+  const orderIds = ids.rows.map((r) => r.id);
 
   if (orderIds.length) {
-    await pool.query(
-      `delete from order_items where order_id = any($1::bigint[])`,
-      [orderIds]
-    );
-    await pool.query(
-      `delete from orders where user_id=$1`,
-      [req.user.id]
-    );
+    await pool.query(`delete from order_items where order_id = any($1::bigint[])`, [orderIds]);
+    await pool.query(`delete from orders where user_id=$1`, [req.user.id]);
   }
 
   res.json({ ok: true, deleted: orderIds.length });
 });
 
 // ================= ADMIN: CUSTOMER ORDERS =================
-app.get("/api/admin/orders/user/:username", requireAuth, requireAdmin, async (req, res) => {
+app.get("/api/admin/orders/user/:username", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const username = req.params.username;
-  const u = await pool.query(`select id, username, balance_int from users_local where username=$1`, [username]);
+  const u = await pool.query(
+    `select id, username, balance_int from users_local where username=$1`,
+    [username]
+  );
+
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
+
   const orders = await pool.query(
-    `select id, status, cart, total_int, created_at from orders where user_id=$1 order by id desc`,
+    `select id, status, cart, total_int, created_at
+     from orders
+     where user_id=$1
+     order by id desc`,
     [u.rows[0].id]
   );
+
   res.json({ ok: true, user: u.rows[0], orders: orders.rows });
 });
 
-app.get("/api/admin/orders", requireAuth, requireAdmin, async (req, res) => {
+app.get("/api/admin/orders", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const rows = await pool.query(`
     select o.id, o.status, o.cart, o.total_int, o.created_at, u.username
     from orders o
@@ -975,7 +1242,7 @@ app.get("/api/admin/orders", requireAuth, requireAdmin, async (req, res) => {
   res.json({ ok: true, orders: rows.rows });
 });
 
-// ✅ Auto-expire job (runs every minute)
+// ================= AUTO-EXPIRE JOB =================
 setInterval(async () => {
   try {
     const r = await pool.query(`
@@ -984,7 +1251,9 @@ setInterval(async () => {
       where status='pending' and expires_at <= now()
       returning id
     `);
-    if (r.rowCount) console.log("Expired expected_payments:", r.rows.map((x) => x.id));
+    if (r.rowCount) {
+      console.log("Expired expected_payments:", r.rows.map((x) => x.id));
+    }
   } catch (e) {
     console.error("expire job error:", e?.message || e);
   }
