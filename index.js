@@ -23,9 +23,6 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
 
-// Add these two to your Railway env vars:
-// DISCORD_PUBLIC_WEBHOOK  — the channel everyone can see (e.g. #sales)
-// DISCORD_ADMIN_WEBHOOK   — a private channel only you can see (e.g. #admin-log)
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
 
@@ -86,7 +83,7 @@ const pool = new Pool({
 
 // ===== DISCORD HELPERS =====
 async function sendToWebhook(url, payload) {
-  if (!url) return; // silently skip if not configured
+  if (!url) return;
   try {
     await fetch(url, {
       method: "POST",
@@ -98,14 +95,12 @@ async function sendToWebhook(url, payload) {
   }
 }
 
-// Public channel — simple friendly message anyone can see
 async function notifyPublic(username, itemCount) {
   await sendToWebhook(DISCORD_PUBLIC_WEBHOOK, {
     content: `🛒 **${username}** successfully bought ${itemCount} account${itemCount !== 1 ? "s" : ""} off the website!`,
   });
 }
 
-// Admin-only channel — full details only you see
 async function notifyAdmin({ username, orderId, totalTokens, itemCount, cartItems }) {
   const itemLines = cartItems
     .map((i) => `• \`${i.code}\` × ${i.qty}${i.credentials ? " ✅" : " ⏳"}`)
@@ -562,6 +557,24 @@ app.post("/api/admin/products/delete", adminLimiter, requireAuth, requireAdmin, 
   res.json({ ok: true });
 });
 
+// ================= BULK DELETE ALL PRODUCTS =================
+app.post("/api/admin/products/delete-all", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Delete unassigned credentials first (assigned ones stay for order history)
+    await client.query(`delete from account_credentials where assigned_order_id is null`);
+    const r = await client.query(`delete from products returning code`);
+    await client.query("COMMIT");
+    console.log(`Admin ${req.user.username} bulk-deleted ${r.rowCount} products`);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("products/delete-all error:", e?.message || e);
+    res.status(500).json({ ok: false, error: "bulk delete failed" });
+  } finally { client.release(); }
+});
+
 // ================= ADMIN: CREDENTIALS =================
 app.post("/api/admin/credentials/add", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const product_code = String(req.body?.product_code || "").trim();
@@ -712,13 +725,9 @@ app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
 
     await client.query("COMMIT");
 
-    // ===== DISCORD NOTIFICATIONS (fire-and-forget, won't affect order response) =====
     const totalItems = enrichedCart.reduce((s, i) => s + i.qty, 0);
-    // Public message — simple, visible to everyone in your sales channel
     notifyPublic(req.user.username, totalItems).catch(console.error);
-    // Admin-only message — full details, only you can see
     notifyAdmin({ username: req.user.username, orderId, totalTokens: total, itemCount: totalItems, cartItems: enrichedCart }).catch(console.error);
-    // ================================================================================
 
     res.json({
       ok: true,
