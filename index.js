@@ -22,6 +22,7 @@ if (!process.env.CREDENTIALS_ENCRYPTION_KEY) {
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
+const TWOFA_INGEST_KEY = process.env.TWOFA_INGEST_KEY || "";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
@@ -59,7 +60,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key, x-twofa-key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -75,6 +76,7 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeade
 const orderLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
 const inventoryLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
 const adminLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+const twofaLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 180, standardHeaders: true, legacyHeaders: false });
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -160,6 +162,16 @@ function requireInventoryKey(req, res, next) {
   next();
 }
 
+function requireTwofaKey(req, res, next) {
+  if (!TWOFA_INGEST_KEY) {
+    return res.status(500).json({ ok: false, error: "TWOFA_INGEST_KEY not configured" });
+  }
+  if (req.header("x-twofa-key") !== TWOFA_INGEST_KEY) {
+    return res.status(401).json({ ok: false, error: "bad twofa key" });
+  }
+  next();
+}
+
 function requireAuth(req, res, next) {
   const auth = req.header("Authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -230,6 +242,10 @@ async function computePriceFromRate(agePots) {
   const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
   const rate = Math.max(1, Number(r.rows[0]?.value || 70));
   return Math.ceil(Number(agePots || 0) / rate);
+}
+
+function normalizeAccountUsername(value) {
+  return String(value || "").trim();
 }
 
 // --------- DB INIT ----------
@@ -335,6 +351,18 @@ async function initDb() {
       meta jsonb not null default '{}'::jsonb,
       created_at timestamptz not null default now()
     );
+
+    create table if not exists account_twofa_codes (
+      id bigserial primary key,
+      account_username text not null,
+      code text not null,
+      source text not null default 'unknown',
+      message_id text,
+      channel_id text,
+      used boolean not null default false,
+      created_at timestamptz not null default now(),
+      expires_at timestamptz not null
+    );
   `);
 
   await pool.query(`
@@ -357,11 +385,24 @@ async function initDb() {
     alter table expected_payments add column if not exists expires_at timestamptz;
     alter table expected_payments add column if not exists matched_at timestamptz;
     alter table expected_payments add column if not exists matched_snapshot_id bigint;
+
+    alter table account_twofa_codes add column if not exists source text not null default 'unknown';
+    alter table account_twofa_codes add column if not exists message_id text;
+    alter table account_twofa_codes add column if not exists channel_id text;
+    alter table account_twofa_codes add column if not exists used boolean not null default false;
+    alter table account_twofa_codes add column if not exists created_at timestamptz not null default now();
+    alter table account_twofa_codes add column if not exists expires_at timestamptz;
   `);
 
   await pool.query(`
     update expected_payments
     set expires_at = created_at + interval '45 minutes'
+    where expires_at is null
+  `);
+
+  await pool.query(`
+    update account_twofa_codes
+    set expires_at = created_at + interval '5 minutes'
     where expires_at is null
   `);
 
@@ -399,6 +440,14 @@ async function initDb() {
       );
     }
   }
+
+  await pool.query(`
+    create index if not exists idx_account_twofa_codes_account_username
+    on account_twofa_codes (account_username);
+
+    create index if not exists idx_account_twofa_codes_expires_at
+    on account_twofa_codes (expires_at);
+  `);
 }
 
 // ================= AUTH =================
@@ -562,7 +611,6 @@ app.post("/api/admin/products/delete-all", adminLimiter, requireAuth, requireAdm
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    // Delete unassigned credentials first (assigned ones stay for order history)
     await client.query(`delete from account_credentials where assigned_order_id is null`);
     const r = await client.query(`delete from products returning code`);
     await client.query("COMMIT");
@@ -706,7 +754,13 @@ app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
       let credentials = null, credId = null;
       if (cred.rows[0]) {
         credId = cred.rows[0].id;
-        credentials = { user: cred.rows[0].roblox_user, pass: decryptText(cred.rows[0].roblox_pass), note: cred.rows[0].note, age_pots: cred.rows[0].age_pots, bucks: cred.rows[0].bucks };
+        credentials = {
+          user: cred.rows[0].roblox_user,
+          pass: decryptText(cred.rows[0].roblox_pass),
+          note: cred.rows[0].note,
+          age_pots: cred.rows[0].age_pots,
+          bucks: cred.rows[0].bucks,
+        };
         await client.query(`update account_credentials set assigned_order_id=-1 where id=$1`, [credId]);
       }
       enrichedCart.push({ code, qty, credentials, _credId: credId });
@@ -752,12 +806,12 @@ app.get("/api/payment-slots", async (req, res) => {
 });
 
 app.post("/api/admin/payment-slots/set", adminLimiter, requireAdminKey, async (req, res) => {
-  const slot           = Math.min(15, Math.max(1, Number(req.body?.slot)));
-  const title          = String(req.body?.title || "");
-  const item_key       = String(req.body?.item_key || "");
+  const slot            = Math.min(15, Math.max(1, Number(req.body?.slot)));
+  const title           = String(req.body?.title || "");
+  const item_key        = String(req.body?.item_key || "");
   const points_per_unit = Math.max(0, Number(req.body?.points_per_unit || 0));
-  const image_url      = req.body?.image_url ? String(req.body.image_url) : null;
-  const enabled        = Boolean(req.body?.enabled);
+  const image_url       = req.body?.image_url ? String(req.body.image_url) : null;
+  const enabled         = Boolean(req.body?.enabled);
   await pool.query(`update payment_slots set title=$2,item_key=$3,points_per_unit=$4,image_url=$5,enabled=$6 where slot=$1`, [slot, title, item_key, points_per_unit, image_url, enabled]);
   res.json({ ok: true });
 });
@@ -853,6 +907,79 @@ async function handleInventoryIngest(req, res) {
 app.post("/inventory",     inventoryLimiter, requireInventoryKey, handleInventoryIngest);
 app.post("/inventory.php", inventoryLimiter, requireInventoryKey, handleInventoryIngest);
 
+// ================= 2FA =================
+app.post("/api/twofa/ingest", twofaLimiter, requireTwofaKey, async (req, res) => {
+  const username = normalizeAccountUsername(req.body?.username);
+  const code = String(req.body?.code || "").trim();
+  const source = String(req.body?.source || "discord_bot").trim().slice(0, 100) || "discord_bot";
+  const message_id = req.body?.message_id ? String(req.body.message_id).trim().slice(0, 100) : null;
+  const channel_id = req.body?.channel_id ? String(req.body.channel_id).trim().slice(0, 100) : null;
+  const expiresInSeconds = Math.max(30, Math.min(900, Number(req.body?.expires_in_seconds || 300)));
+
+  if (!username || !code) {
+    return res.status(400).json({ ok: false, error: "missing username/code" });
+  }
+
+  const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
+
+  const inserted = await pool.query(
+    `insert into account_twofa_codes (account_username, code, source, message_id, channel_id, expires_at)
+     values ($1, $2, $3, $4, $5, $6)
+     returning id, account_username, code, created_at, expires_at`,
+    [username, code, source, message_id, channel_id, expiresAt]
+  );
+
+  res.json({ ok: true, entry: inserted.rows[0] });
+});
+
+async function getOwnedAccountUsernames(userId) {
+  const orders = await pool.query(
+    `select cart from orders where user_id=$1 and status='completed' order by id desc`,
+    [userId]
+  );
+
+  const usernames = new Set();
+
+  for (const order of orders.rows) {
+    const cart = Array.isArray(order.cart) ? order.cart : [];
+    for (const item of cart) {
+      const ownedUser = normalizeAccountUsername(item?.credentials?.user);
+      if (ownedUser) usernames.add(ownedUser);
+    }
+  }
+
+  return [...usernames];
+}
+
+async function sendMyTwofaCodes(req, res) {
+  const usernames = await getOwnedAccountUsernames(req.user.id);
+
+  if (!usernames.length) {
+    return res.json({ ok: true, codes: [] });
+  }
+
+  const r = await pool.query(
+    `select distinct on (account_username)
+        account_username,
+        code,
+        created_at,
+        expires_at,
+        source
+     from account_twofa_codes
+     where account_username = any($1::text[])
+       and expires_at > now()
+       and used = false
+     order by account_username, id desc`,
+    [usernames]
+  );
+
+  res.json({ ok: true, codes: r.rows });
+}
+
+app.get("/api/my-2fa-codes", requireAuth, sendMyTwofaCodes);
+app.get("/api/my-accounts/2fa", requireAuth, sendMyTwofaCodes);
+app.get("/api/twofa/my", requireAuth, sendMyTwofaCodes);
+
 // ================= LEADERBOARD + MY ACCOUNTS =================
 app.get("/api/leaderboard", async (req, res) => {
   const rows = await pool.query(`
@@ -911,12 +1038,22 @@ app.get("/api/admin/orders", adminLimiter, requireAuth, requireAdmin, async (req
   res.json({ ok: true, orders: rows.rows });
 });
 
-// ================= AUTO-EXPIRE JOB =================
+// ================= AUTO-EXPIRE JOBS =================
 setInterval(async () => {
   try {
     const r = await pool.query(`update expected_payments set status='expired' where status='pending' and expires_at <= now() returning id`);
     if (r.rowCount) console.log("Expired expected_payments:", r.rows.map((x) => x.id));
-  } catch (e) { console.error("expire job error:", e?.message || e); }
+  } catch (e) {
+    console.error("expire job error:", e?.message || e);
+  }
+}, 60_000);
+
+setInterval(async () => {
+  try {
+    await pool.query(`delete from account_twofa_codes where expires_at <= now()`);
+  } catch (e) {
+    console.error("2FA cleanup error:", e?.message || e);
+  }
 }, 60_000);
 
 // ================= START =================
