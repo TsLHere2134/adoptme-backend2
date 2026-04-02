@@ -775,6 +775,7 @@ app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
 
 // ================= INVENTORY INGEST =================
 async function handleInventoryIngest(req, res) {
+  const receiver_account = String(req.body?.receiver_account || req.body?.user || "unknown");
   console.log("INVENTORY BODY:", JSON.stringify(req.body));
   const snapshot = req.body;
   const last = await pool.query(`select data from inventory_snapshots where receiver_account=$1 order by id desc limit 1`, [receiver_account]);
