@@ -85,14 +85,16 @@ function normalizeAccountUsername(raw) {
 function countFromSnapshot(snapshot) {
   const counts = {};
   if (!snapshot || typeof snapshot !== "object") return counts;
-  const items = Array.isArray(snapshot.items)
-    ? snapshot.items
-    : Array.isArray(snapshot)
-    ? snapshot
-    : Object.entries(snapshot.items || snapshot).map(([k, v]) => ({ key: k, count: v }));
-  for (const item of items) {
-    const key = String(item.key || item.item_key || item.name || "").trim();
-    const count = Number(item.count ?? item.qty ?? item.quantity ?? 0);
+
+  // Your sender uses a "food" array with {name, quantity} objects
+  const sources = [
+    ...(Array.isArray(snapshot.food)  ? snapshot.food  : []),
+    ...(Array.isArray(snapshot.items) ? snapshot.items : []),
+  ];
+
+  for (const item of sources) {
+    const key = String(item.name || item.key || item.item_key || "").trim();
+    const count = Number(item.quantity ?? item.count ?? item.qty ?? 0);
     if (key && count > 0) counts[key] = (counts[key] || 0) + count;
   }
   return counts;
