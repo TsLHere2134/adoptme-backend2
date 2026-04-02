@@ -15,34 +15,296 @@ const app = express();
 if (!process.env.JWT_SECRET) throw new Error("JWT_SECRET is required");
 if (!process.env.ADMIN_KEY) throw new Error("ADMIN_KEY is required");
 if (!process.env.INVENTORY_API_KEY) throw new Error("INVENTORY_API_KEY is required");
-if (!process.env.CREDENTIALS_ENCRYPTION_KEY) {
-  throw new Error("CREDENTIALS_ENCRYPTION_KEY is required");
-}
+if (!process.env.CREDENTIALS_ENCRYPTION_KEY) throw new Error("CREDENTIALS_ENCRYPTION_KEY is required");
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_KEY = process.env.ADMIN_KEY;
+const JWT_SECRET        = process.env.JWT_SECRET;
+const ADMIN_KEY         = process.env.ADMIN_KEY;
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
-const TWOFA_INGEST_KEY = process.env.TWOFA_INGEST_KEY || "";
+const TWOFA_INGEST_KEY  = process.env.TWOFA_INGEST_KEY || "";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
 
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
-const ENC_KEY = crypto
-  .createHash("sha256")
-  .update(process.env.CREDENTIALS_ENCRYPTION_KEY)
-  .digest();
+const ENC_KEY = crypto.createHash("sha256").update(process.env.CREDENTIALS_ENCRYPTION_KEY).digest();
 
-// ===== BASIC APP =====
+// ===== DATABASE =====
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("railway") || process.env.DATABASE_SSL === "true"
+    ? { rejectUnauthorized: false }
+    : false,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+// ===== ENCRYPTION =====
+function encryptText(text) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", ENC_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(String(text), "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+function decryptText(stored) {
+  try {
+    const [ivHex, encHex] = String(stored).split(":");
+    const iv = Buffer.from(ivHex, "hex");
+    const enc = Buffer.from(encHex, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", ENC_KEY, iv);
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+  } catch {
+    return stored;
+  }
+}
+
+// ===== HELPERS =====
+function makeCode(roblox_user) {
+  return "ACC_" + String(roblox_user).toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24) + "_" + Date.now().toString(36);
+}
+
+async function computePriceFromRate(age_pots) {
+  try {
+    const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
+    const rate = Number(r.rows[0]?.value || 70);
+    return Math.max(1, Math.ceil(Number(age_pots) / rate));
+  } catch {
+    return Math.max(1, Math.ceil(Number(age_pots) / 70));
+  }
+}
+
+function normalizeAccountUsername(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  return s.length > 0 ? s : null;
+}
+
+function countFromSnapshot(snapshot) {
+  const counts = {};
+  if (!snapshot || typeof snapshot !== "object") return counts;
+  const items = Array.isArray(snapshot.items)
+    ? snapshot.items
+    : Array.isArray(snapshot)
+    ? snapshot
+    : Object.entries(snapshot.items || snapshot).map(([k, v]) => ({ key: k, count: v }));
+  for (const item of items) {
+    const key = String(item.key || item.item_key || item.name || "").trim();
+    const count = Number(item.count ?? item.qty ?? item.quantity ?? 0);
+    if (key && count > 0) counts[key] = (counts[key] || 0) + count;
+  }
+  return counts;
+}
+
+function deltaCounts(prev, curr) {
+  const delta = {};
+  for (const [k, v] of Object.entries(curr)) {
+    const d = v - (prev[k] || 0);
+    if (d > 0) delta[k] = d;
+  }
+  return delta;
+}
+
+function satisfies(delta, expectedRaw) {
+  try {
+    const expected = typeof expectedRaw === "string" ? JSON.parse(expectedRaw) : expectedRaw;
+    for (const [key, qty] of Object.entries(expected)) {
+      if ((delta[key] || 0) < Number(qty)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function notifyPublic(username, itemCount) {
+  if (!DISCORD_PUBLIC_WEBHOOK) return;
+  try {
+    await fetch(DISCORD_PUBLIC_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: `🛒 **${username}** just purchased ${itemCount} account${itemCount !== 1 ? "s" : ""}!` }),
+    });
+  } catch (e) { console.error("notifyPublic error:", e?.message); }
+}
+
+async function notifyAdmin({ username, orderId, totalTokens, itemCount, cartItems }) {
+  if (!DISCORD_ADMIN_WEBHOOK) return;
+  try {
+    const lines = (cartItems || []).map((i) =>
+      `• \`${i.code}\` × ${i.qty}${i.credentials ? ` → **${i.credentials.user}**` : " (no cred)"}`
+    );
+    await fetch(DISCORD_ADMIN_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        embeds: [{
+          title: `Order #${orderId} — ${username}`,
+          color: 0x8b7cf6,
+          fields: [
+            { name: "Tokens", value: String(totalTokens), inline: true },
+            { name: "Items",  value: String(itemCount),   inline: true },
+            { name: "Cart",   value: lines.join("\n") || "—" },
+          ],
+          timestamp: new Date().toISOString(),
+        }],
+      }),
+    });
+  } catch (e) { console.error("notifyAdmin error:", e?.message); }
+}
+
+// ===== AUTH MIDDLEWARE =====
+const requireAuth = (req, res, next) => {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token) return res.status(401).json({ ok: false, error: "auth required" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "invalid or expired token" });
+  }
+};
+
+const requireAdmin = (req, res, next) => {
+  if (!req.user?.is_admin) return res.status(403).json({ ok: false, error: "admin only" });
+  next();
+};
+
+const requireAdminKey = (req, res, next) => {
+  const key = req.headers["x-admin-key"] || req.body?.admin_key || "";
+  if (key !== ADMIN_KEY) return res.status(403).json({ ok: false, error: "invalid admin key" });
+  next();
+};
+
+const requireInventoryKey = (req, res, next) => {
+  const key = req.headers["x-inventory-key"] || req.query?.key || "";
+  if (key !== INVENTORY_API_KEY) return res.status(403).json({ ok: false, error: "invalid inventory key" });
+  next();
+};
+
+const requireTwofaKey = (req, res, next) => {
+  const key = req.headers["x-twofa-key"] || "";
+  if (!TWOFA_INGEST_KEY || key !== TWOFA_INGEST_KEY) return res.status(403).json({ ok: false, error: "invalid 2fa key" });
+  next();
+};
+
+// ===== DB INIT =====
+async function initDb() {
+  await pool.query(`
+    create table if not exists users_local (
+      id bigserial primary key,
+      username text unique not null,
+      password_hash text not null,
+      balance_int bigint not null default 0,
+      is_admin boolean not null default false,
+      is_blacklisted boolean not null default false,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists settings (
+      key text primary key,
+      value text not null
+    );
+    insert into settings(key,value) values('rate_agepots_per_token','70') on conflict(key) do nothing;
+    create table if not exists products (
+      id bigserial primary key,
+      code text unique not null,
+      title text not null default '',
+      kind text not null default 'account',
+      age_pots bigint not null default 0,
+      bucks bigint not null default 0,
+      price_int bigint not null default 0,
+      stock_int int not null default 0,
+      note text not null default '',
+      image_url text not null default '',
+      sold boolean not null default false,
+      purchases_count int not null default 0,
+      sold_at timestamptz,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists account_credentials (
+      id bigserial primary key,
+      product_code text not null,
+      roblox_user text not null,
+      roblox_pass text not null,
+      note text not null default '',
+      age_pots bigint not null default 0,
+      bucks bigint not null default 0,
+      assigned_order_id bigint,
+      assigned_at timestamptz,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists orders (
+      id bigserial primary key,
+      user_id bigint not null,
+      cart jsonb not null default '[]',
+      total_int bigint not null default 0,
+      status text not null default 'pending',
+      created_at timestamptz not null default now()
+    );
+    create table if not exists order_items (
+      id bigserial primary key,
+      order_id bigint not null,
+      product_code text not null,
+      qty int not null default 1
+    );
+    create table if not exists token_ledger (
+      id bigserial primary key,
+      user_id bigint not null,
+      delta bigint not null,
+      reason text not null,
+      meta jsonb not null default '{}',
+      created_at timestamptz not null default now()
+    );
+    create table if not exists payment_slots (
+      slot int primary key,
+      title text not null default '',
+      item_key text not null default '',
+      points_per_unit numeric not null default 0,
+      image_url text,
+      enabled boolean not null default false
+    );
+    insert into payment_slots(slot) select generate_series(1,15) on conflict(slot) do nothing;
+    create table if not exists expected_payments (
+      id bigserial primary key,
+      user_id bigint not null,
+      type text not null default 'slot',
+      expected jsonb not null default '{}',
+      points_to_credit numeric not null default 0,
+      receiver_account text not null,
+      status text not null default 'pending',
+      expires_at timestamptz not null,
+      matched_at timestamptz,
+      matched_snapshot_id bigint,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists inventory_snapshots (
+      id bigserial primary key,
+      receiver_account text not null,
+      data jsonb not null default '{}',
+      delta jsonb not null default '{}',
+      received_at timestamptz not null default now()
+    );
+    create table if not exists account_twofa_codes (
+      id bigserial primary key,
+      account_username text not null,
+      code text not null,
+      source text not null default 'discord_bot',
+      message_id text,
+      channel_id text,
+      expires_at timestamptz not null,
+      used boolean not null default false,
+      created_at timestamptz not null default now()
+    );
+  `);
+}
+
+// ===== BASIC APP SETUP =====
 app.set("trust proxy", 1);
-
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 app.get("/", (req, res) => res.status(200).send("API running ✅"));
-
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 
@@ -66,17 +328,14 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-  console.log("REQ", req.method, req.url);
-  next();
-});
+app.use((req, res, next) => { console.log("REQ", req.method, req.url); next(); });
 
 // ===== RATE LIMITERS =====
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
-const orderLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false });
-const inventoryLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
-const adminLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
-const twofaLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 180, standardHeaders: true, legacyHeaders: false });
+const authLimiter      = rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  standardHeaders: true, legacyHeaders: false });
+const orderLimiter     = rateLimit({ windowMs: 10 * 60 * 1000, max: 20,  standardHeaders: true, legacyHeaders: false });
+const inventoryLimiter = rateLimit({ windowMs:  1 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
+const adminLimiter     = rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+const twofaLimiter     = rateLimit({ windowMs:  1 * 60 * 1000, max: 180, standardHeaders: true, legacyHeaders: false });
 
 // ================= AUTH =================
 app.post("/api/auth/register", authLimiter, async (req, res) => {
@@ -111,8 +370,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   if (!ok) return res.status(401).json({ ok: false, error: "bad login" });
   const token = jwt.sign(
     { id: u.rows[0].id, username: u.rows[0].username, is_admin: u.rows[0].is_admin },
-    JWT_SECRET,
-    { expiresIn: "30d" }
+    JWT_SECRET, { expiresIn: "30d" }
   );
   res.json({
     ok: true, token,
@@ -122,8 +380,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const u = await pool.query(
-    `select id,username,balance_int,is_admin,is_blacklisted,created_at from users_local where id=$1`,
-    [req.user.id]
+    `select id,username,balance_int,is_admin,is_blacklisted,created_at from users_local where id=$1`, [req.user.id]
   );
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
@@ -148,8 +405,7 @@ app.post("/api/admin/settings", adminLimiter, requireAdminKey, async (req, res) 
 // ================= PRODUCTS =================
 app.get("/api/products", async (req, res) => {
   const rows = await pool.query(`
-    select
-      p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
+    select p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
       p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count,
       count(c.id) filter (where c.assigned_order_id is null) as cred_count
     from products p
@@ -161,27 +417,18 @@ app.get("/api/products", async (req, res) => {
   res.json({ ok: true, products: rows.rows });
 });
 
-// ===== OWNER VAULT (ALL ACCOUNTS IN ONE REQUEST) =====
+// ===== OWNER VAULT =====
 app.get("/api/admin/all-accounts", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT roblox_user
-      FROM account_credentials
-      WHERE roblox_user IS NOT NULL
-      ORDER BY id ASC
-    `);
-
-    const users = result.rows.map(r => ({
-      user: String(r.roblox_user || "").trim()
-    })).filter(x => x.user.length > 0);
-
+    const result = await pool.query(`select roblox_user from account_credentials where roblox_user is not null order by id asc`);
+    const users = result.rows.map(r => ({ user: String(r.roblox_user || "").trim() })).filter(x => x.user.length > 0);
     res.json(users);
-
   } catch (err) {
     console.error("Vault fetch error:", err);
     res.status(500).json({ error: "Failed to fetch accounts" });
   }
 });
+
 // ================= JWT ADMIN: USERS =================
 app.post("/api/admin/users/balance", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const username = String(req.body?.username || "").trim();
@@ -255,7 +502,6 @@ app.post("/api/admin/products/delete", adminLimiter, requireAuth, requireAdmin, 
   res.json({ ok: true });
 });
 
-// ================= BULK DELETE ALL PRODUCTS =================
 app.post("/api/admin/products/delete-all", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -282,11 +528,10 @@ app.post("/api/admin/credentials/add", adminLimiter, requireAuth, requireAdmin, 
   const bucks        = Math.max(0, Number(req.body?.bucks    || 0));
   if (!product_code || !roblox_user || !roblox_pass)
     return res.status(400).json({ ok: false, error: "product_code, roblox_user, roblox_pass required" });
-  const encryptedPass = encryptText(roblox_pass);
   const r = await pool.query(
     `insert into account_credentials (product_code,roblox_user,roblox_pass,note,age_pots,bucks)
      values ($1,$2,$3,$4,$5,$6) returning id,product_code,roblox_user,assigned_order_id,created_at`,
-    [product_code, roblox_user, encryptedPass, note, age_pots, bucks]
+    [product_code, roblox_user, encryptText(roblox_pass), note, age_pots, bucks]
   );
   await pool.query(`update products set stock_int = stock_int + 1, sold = false where code=$1`, [product_code]);
   res.json({ ok: true, credential: r.rows[0] });
@@ -296,8 +541,7 @@ app.get("/api/admin/credentials/:code", adminLimiter, requireAuth, requireAdmin,
   const code = req.params.code;
   const r = await pool.query(
     `select id, product_code, roblox_user, roblox_pass, note, age_pots, bucks, assigned_order_id, created_at
-     from account_credentials where product_code=$1 order by id asc`,
-    [code]
+     from account_credentials where product_code=$1 order by id asc`, [code]
   );
   res.json({ ok: true, credentials: r.rows.map((row) => ({ ...row, roblox_pass: decryptText(row.roblox_pass) })) });
 });
@@ -352,81 +596,53 @@ app.post("/api/admin/credentials/import", adminLimiter, requireAuth, requireAdmi
   res.json({ ok: true, inserted, skipped, total: lines.length, products });
 });
 
-// ================= ADMIN: IMPORT PASSWORDS (update existing creds only) =================
+// ================= ADMIN: IMPORT PASSWORDS =================
 app.post("/api/admin/credentials/import-passwords", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
-  // Accepts body.text OR body.csv — one line per: username:newpassword
   const raw = String(req.body?.text || req.body?.csv || "").trim();
   if (!raw) return res.status(400).json({ ok: false, error: "text required" });
-
   const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
   let updated_available = 0, updated_sold = 0, skipped = 0;
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
     for (const line of lines) {
       const colonIdx = line.indexOf(":");
       if (colonIdx < 1) { skipped++; continue; }
       const roblox_user = line.slice(0, colonIdx).trim();
       const new_pass    = line.slice(colonIdx + 1).trim();
       if (!roblox_user || !new_pass) { skipped++; continue; }
-
-      // Find credential — case-insensitive, take latest if dupes
       const credResult = await client.query(
-        `select id, assigned_order_id
-         from account_credentials
-         where lower(roblox_user) = lower($1)
-         order by id desc limit 1`,
+        `select id, assigned_order_id from account_credentials where lower(roblox_user) = lower($1) order by id desc limit 1`,
         [roblox_user]
       );
       if (!credResult.rows[0]) { skipped++; continue; }
-
       const { id: credId, assigned_order_id } = credResult.rows[0];
-      await client.query(
-        `update account_credentials set roblox_pass = $1 where id = $2`,
-        [encryptText(new_pass), credId]
-      );
-
+      await client.query(`update account_credentials set roblox_pass = $1 where id = $2`, [encryptText(new_pass), credId]);
       if (assigned_order_id && assigned_order_id > 0) {
-        // Also patch the password inside orders.cart so customer sees the new one
-        const orderResult = await client.query(
-          `select id, cart from orders where id = $1`,
-          [assigned_order_id]
-        );
+        const orderResult = await client.query(`select id, cart from orders where id = $1`, [assigned_order_id]);
         for (const orderRow of orderResult.rows) {
           const cart = Array.isArray(orderRow.cart) ? orderRow.cart : [];
           let patched = false;
           const newCart = cart.map((item) => {
-            if (item?.credentials?.user &&
-                item.credentials.user.toLowerCase() === roblox_user.toLowerCase()) {
+            if (item?.credentials?.user && item.credentials.user.toLowerCase() === roblox_user.toLowerCase()) {
               patched = true;
               return { ...item, credentials: { ...item.credentials, pass: new_pass } };
             }
             return item;
           });
-          if (patched) {
-            await client.query(
-              `update orders set cart = $1 where id = $2`,
-              [JSON.stringify(newCart), orderRow.id]
-            );
-          }
+          if (patched) await client.query(`update orders set cart = $1 where id = $2`, [JSON.stringify(newCart), orderRow.id]);
         }
         updated_sold++;
       } else {
         updated_available++;
       }
     }
-
     await client.query("COMMIT");
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("import-passwords error:", e?.message || e);
     return res.status(500).json({ ok: false, error: "import failed" });
-  } finally {
-    client.release();
-  }
-
+  } finally { client.release(); }
   console.log(`Admin ${req.user.username} import-passwords: +${updated_available} avail, +${updated_sold} sold, ${skipped} skipped`);
   res.json({ ok: true, updated_available, updated_sold, skipped, total: lines.length });
 });
@@ -435,28 +651,19 @@ app.post("/api/admin/credentials/import-passwords", adminLimiter, requireAuth, r
 app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
   if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
-
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
     const codes = [...new Set(cart.map((i) => String(i.code || "")))];
-    const prods = await client.query(
-      `select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`,
-      [codes]
-    );
+    const prods = await client.query(`select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`, [codes]);
     const map = new Map(prods.rows.map((p) => [p.code, p]));
-
     let total = 0;
     for (const item of cart) {
-      const code = String(item.code || "");
-      const qty  = Math.max(1, Number(item.qty || 1));
-      const p    = map.get(code);
+      const code = String(item.code || ""); const qty = Math.max(1, Number(item.qty || 1)); const p = map.get(code);
       if (!p) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `unknown product: ${code}` }); }
       if (p.sold || Number(p.stock_int) < qty) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `out of stock: ${code}` }); }
       total += Number(p.price_int) * qty;
     }
-
     const userRow = await client.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
     const user = userRow.rows[0];
     if (!user) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, error: "user not found" }); }
@@ -464,67 +671,44 @@ app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ ok: false, error: `Not enough tokens. Need ${total}, you have ${user.balance_int}.` });
     }
-
     await client.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [total, req.user.id]);
     await client.query(`insert into token_ledger (user_id, delta, reason, meta) values ($1,$2,'purchase',$3::jsonb)`, [req.user.id, -total, JSON.stringify({ cart })]);
-
     const enrichedCart = [];
     for (const item of cart) {
-      const code = String(item.code || "");
-      const qty  = Math.max(1, Number(item.qty || 1));
+      const code = String(item.code || ""); const qty = Math.max(1, Number(item.qty || 1));
       await client.query(`update products set stock_int = GREATEST(0, stock_int - $1), purchases_count = purchases_count + $1 where code = $2`, [qty, code]);
       await client.query(`update products set sold = (stock_int <= 0), sold_at = case when stock_int <= 0 then now() else sold_at end where code = $1`, [code]);
       const cred = await client.query(
         `select id, roblox_user, roblox_pass, note, age_pots, bucks from account_credentials
-         where product_code = $1 and assigned_order_id is null order by id asc limit 1 for update skip locked`,
-        [code]
+         where product_code = $1 and assigned_order_id is null order by id asc limit 1 for update skip locked`, [code]
       );
       let credentials = null, credId = null;
       if (cred.rows[0]) {
         credId = cred.rows[0].id;
-        credentials = {
-          user: cred.rows[0].roblox_user,
-          pass: decryptText(cred.rows[0].roblox_pass),
-          note: cred.rows[0].note,
-          age_pots: cred.rows[0].age_pots,
-          bucks: cred.rows[0].bucks,
-        };
+        credentials = { user: cred.rows[0].roblox_user, pass: decryptText(cred.rows[0].roblox_pass), note: cred.rows[0].note, age_pots: cred.rows[0].age_pots, bucks: cred.rows[0].bucks };
         await client.query(`update account_credentials set assigned_order_id=-1 where id=$1`, [credId]);
       }
       enrichedCart.push({ code, qty, credentials, _credId: credId });
     }
-
     const created = await client.query(
       `insert into orders (user_id, cart, total_int, status) values ($1::bigint,$2,$3,'completed') returning id, status, total_int, created_at`,
       [req.user.id, JSON.stringify(enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials }))), total]
     );
     const orderId = created.rows[0].id;
-
     for (const item of enrichedCart) {
       if (item._credId) await client.query(`update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`, [orderId, item._credId]);
       await client.query(`insert into order_items(order_id,product_code,qty) values($1,$2,$3)`, [orderId, item.code, item.qty]);
     }
-
     await client.query("COMMIT");
-
     const totalItems = enrichedCart.reduce((s, i) => s + i.qty, 0);
     notifyPublic(req.user.username, totalItems).catch(console.error);
     notifyAdmin({ username: req.user.username, orderId, totalTokens: total, itemCount: totalItems, cartItems: enrichedCart }).catch(console.error);
-
-    res.json({
-      ok: true,
-      order: {
-        ...created.rows[0],
-        cart: enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials })),
-      },
-    });
+    res.json({ ok: true, order: { ...created.rows[0], cart: enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials })) } });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("orders/create error:", err?.message || err);
     res.status(500).json({ ok: false, error: "order failed" });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // ================= PAYMENT SLOTS =================
@@ -577,8 +761,7 @@ app.post("/api/payments/expect-multi", requireAuth, async (req, res) => {
   const byKey = new Map(rows.rows.map((r) => [String(r.item_key || ""), r]));
   let expected = {}, totalPoints = 0;
   for (const [k, v] of Object.entries(items)) {
-    const key = String(k || "").trim();
-    const qty = Math.floor(Number(v || 0));
+    const key = String(k || "").trim(); const qty = Math.floor(Number(v || 0));
     if (!key || qty <= 0) continue;
     const slotRow = byKey.get(key);
     if (!slotRow || !slotRow.enabled) return res.status(400).json({ ok: false, error: `slot disabled or unknown item_key: ${key}` });
@@ -643,31 +826,19 @@ app.post("/api/twofa/ingest", twofaLimiter, requireTwofaKey, async (req, res) =>
   const message_id = req.body?.message_id ? String(req.body.message_id).trim().slice(0, 100) : null;
   const channel_id = req.body?.channel_id ? String(req.body.channel_id).trim().slice(0, 100) : null;
   const expiresInSeconds = Math.max(30, Math.min(900, Number(req.body?.expires_in_seconds || 300)));
-
-  if (!username || !code) {
-    return res.status(400).json({ ok: false, error: "missing username/code" });
-  }
-
+  if (!username || !code) return res.status(400).json({ ok: false, error: "missing username/code" });
   const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
-
   const inserted = await pool.query(
     `insert into account_twofa_codes (account_username, code, source, message_id, channel_id, expires_at)
-     values ($1, $2, $3, $4, $5, $6)
-     returning id, account_username, code, created_at, expires_at`,
+     values ($1, $2, $3, $4, $5, $6) returning id, account_username, code, created_at, expires_at`,
     [username, code, source, message_id, channel_id, expiresAt]
   );
-
   res.json({ ok: true, entry: inserted.rows[0] });
 });
 
 async function getOwnedAccountUsernames(userId) {
-  const orders = await pool.query(
-    `select cart from orders where user_id=$1 and status='completed' order by id desc`,
-    [userId]
-  );
-
+  const orders = await pool.query(`select cart from orders where user_id=$1 and status='completed' order by id desc`, [userId]);
   const usernames = new Set();
-
   for (const order of orders.rows) {
     const cart = Array.isArray(order.cart) ? order.cart : [];
     for (const item of cart) {
@@ -675,38 +846,25 @@ async function getOwnedAccountUsernames(userId) {
       if (ownedUser) usernames.add(ownedUser);
     }
   }
-
   return [...usernames];
 }
 
 async function sendMyTwofaCodes(req, res) {
   const usernames = await getOwnedAccountUsernames(req.user.id);
-
-  if (!usernames.length) {
-    return res.json({ ok: true, codes: [] });
-  }
-
+  if (!usernames.length) return res.json({ ok: true, codes: [] });
   const r = await pool.query(
-    `select distinct on (account_username)
-        account_username,
-        code,
-        created_at,
-        expires_at,
-        source
+    `select distinct on (account_username) account_username, code, created_at, expires_at, source
      from account_twofa_codes
-     where account_username = any($1::text[])
-       and expires_at > now()
-       and used = false
+     where account_username = any($1::text[]) and expires_at > now() and used = false
      order by account_username, id desc`,
     [usernames]
   );
-
   res.json({ ok: true, codes: r.rows });
 }
 
-app.get("/api/my-2fa-codes", requireAuth, sendMyTwofaCodes);
+app.get("/api/my-2fa-codes",    requireAuth, sendMyTwofaCodes);
 app.get("/api/my-accounts/2fa", requireAuth, sendMyTwofaCodes);
-app.get("/api/twofa/my", requireAuth, sendMyTwofaCodes);
+app.get("/api/twofa/my",        requireAuth, sendMyTwofaCodes);
 
 // ================= LEADERBOARD + MY ACCOUNTS =================
 app.get("/api/leaderboard", async (req, res) => {
@@ -771,17 +929,13 @@ setInterval(async () => {
   try {
     const r = await pool.query(`update expected_payments set status='expired' where status='pending' and expires_at <= now() returning id`);
     if (r.rowCount) console.log("Expired expected_payments:", r.rows.map((x) => x.id));
-  } catch (e) {
-    console.error("expire job error:", e?.message || e);
-  }
+  } catch (e) { console.error("expire job error:", e?.message || e); }
 }, 60_000);
 
 setInterval(async () => {
   try {
     await pool.query(`delete from account_twofa_codes where expires_at <= now()`);
-  } catch (e) {
-    console.error("2FA cleanup error:", e?.message || e);
-  }
+  } catch (e) { console.error("2FA cleanup error:", e?.message || e); }
 }, 60_000);
 
 // ================= START =================
