@@ -533,6 +533,27 @@ app.get("/api/products", async (req, res) => {
   res.json({ ok: true, products: rows.rows });
 });
 
+// ===== OWNER VAULT (ALL ACCOUNTS IN ONE REQUEST) =====
+app.get("/api/admin/all-accounts", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT roblox_user
+      FROM account_credentials
+      WHERE roblox_user IS NOT NULL
+      ORDER BY id ASC
+    `);
+
+    const users = result.rows.map(r => ({
+      user: String(r.roblox_user || "").trim()
+    })).filter(x => x.user.length > 0);
+
+    res.json(users);
+
+  } catch (err) {
+    console.error("Vault fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch accounts" });
+  }
+});
 // ================= JWT ADMIN: USERS =================
 app.post("/api/admin/users/balance", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const username = String(req.body?.username || "").trim();
