@@ -78,378 +78,6 @@ const inventoryLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 120, standard
 const adminLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
 const twofaLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 180, standardHeaders: true, legacyHeaders: false });
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : undefined,
-});
-
-// ===== DISCORD HELPERS =====
-async function sendToWebhook(url, payload) {
-  if (!url) return;
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    console.error("Discord webhook error:", e?.message || e);
-  }
-}
-
-async function notifyPublic(username, itemCount) {
-  await sendToWebhook(DISCORD_PUBLIC_WEBHOOK, {
-    content: `🛒 **${username}** successfully bought ${itemCount} account${itemCount !== 1 ? "s" : ""} off the website!`,
-  });
-}
-
-async function notifyAdmin({ username, orderId, totalTokens, itemCount, cartItems }) {
-  const itemLines = cartItems
-    .map((i) => `• \`${i.code}\` × ${i.qty}${i.credentials ? " ✅" : " ⏳"}`)
-    .join("\n");
-
-  await sendToWebhook(DISCORD_ADMIN_WEBHOOK, {
-    embeds: [{
-      title: "🧾 New Order — Admin Log",
-      color: 0x8b7cf6,
-      fields: [
-        { name: "👤 User",          value: `\`${username}\``,         inline: true  },
-        { name: "🧾 Order ID",      value: `#${orderId}`,             inline: true  },
-        { name: "🪙 Tokens Spent",  value: `${totalTokens} tokens`,   inline: true  },
-        { name: "📦 Accounts",      value: `${itemCount}`,            inline: true  },
-        { name: "🗂 Items",         value: itemLines || "—",          inline: false },
-      ],
-      footer: { text: "AdoptMeHub — Admin Only" },
-      timestamp: new Date().toISOString(),
-    }],
-  });
-}
-
-// --------- CRYPTO HELPERS ----------
-function encryptText(text) {
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv("aes-256-cbc", ENC_KEY, iv);
-  let encrypted = cipher.update(String(text), "utf8", "hex");
-  encrypted += cipher.final("hex");
-  return `${iv.toString("hex")}:${encrypted}`;
-}
-
-function decryptText(value) {
-  try {
-    const raw = String(value || "");
-    const [ivHex, encrypted] = raw.split(":");
-    if (!ivHex || !encrypted) return raw;
-    const iv = Buffer.from(ivHex, "hex");
-    const decipher = crypto.createDecipheriv("aes-256-cbc", ENC_KEY, iv);
-    let decrypted = decipher.update(encrypted, "hex", "utf8");
-    decrypted += decipher.final("utf8");
-    return decrypted;
-  } catch {
-    return String(value || "");
-  }
-}
-
-// --------- AUTH HELPERS ----------
-function requireAdminKey(req, res, next) {
-  if (req.header("x-admin-key") !== ADMIN_KEY)
-    return res.status(401).json({ ok: false, error: "bad admin key" });
-  next();
-}
-
-function requireInventoryKey(req, res, next) {
-  if (req.header("x-inventory-key") !== INVENTORY_API_KEY)
-    return res.status(401).json({ ok: false, error: "bad inventory key" });
-  next();
-}
-
-function requireTwofaKey(req, res, next) {
-  if (!TWOFA_INGEST_KEY) {
-    return res.status(500).json({ ok: false, error: "TWOFA_INGEST_KEY not configured" });
-  }
-  if (req.header("x-twofa-key") !== TWOFA_INGEST_KEY) {
-    return res.status(401).json({ ok: false, error: "bad twofa key" });
-  }
-  next();
-}
-
-function requireAuth(req, res, next) {
-  const auth = req.header("Authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!token) return res.status(401).json({ ok: false, error: "missing token" });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    payload.id = Number(payload.id);
-    if (!payload.id || Number.isNaN(payload.id))
-      return res.status(401).json({ ok: false, error: "invalid token payload" });
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ ok: false, error: "invalid token" });
-  }
-}
-
-function requireAdmin(req, res, next) {
-  if (!req.user?.is_admin) return res.status(403).json({ ok: false, error: "admin only" });
-  next();
-}
-
-// --------- INVENTORY DELTA HELPERS ----------
-function countFromSnapshot(snapshot) {
-  const counts = {};
-  const pets = Array.isArray(snapshot?.pets) ? snapshot.pets : [];
-  for (const p of pets) {
-    const k = String(p?.name || p?.id || "unknown_pet");
-    counts[k] = (counts[k] || 0) + 1;
-  }
-  const food = Array.isArray(snapshot?.food) ? snapshot.food : [];
-  for (const f of food) {
-    const k = String(f?.name || f?.id || "unknown_food");
-    const qty = Number(f?.quantity || 1);
-    counts[k] = (counts[k] || 0) + qty;
-  }
-  return counts;
-}
-
-function deltaCounts(prevCounts, newCounts) {
-  const delta = {};
-  const keys = new Set([...Object.keys(prevCounts || {}), ...Object.keys(newCounts || {})]);
-  for (const k of keys) {
-    const d = (newCounts?.[k] || 0) - (prevCounts?.[k] || 0);
-    if (d > 0) delta[k] = d;
-  }
-  return delta;
-}
-
-function satisfies(delta, expected) {
-  for (const [k, need] of Object.entries(expected || {})) {
-    if ((delta?.[k] || 0) < Number(need)) return false;
-  }
-  return true;
-}
-
-// --------- HELPERS ----------
-function makeCode(username) {
-  const base = String(username || "ACC")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .slice(0, 4)
-    .padEnd(3, "X");
-  const rand = String(Math.floor(1000 + Math.random() * 9000));
-  return "U" + base + rand;
-}
-
-async function computePriceFromRate(agePots) {
-  const r = await pool.query(`select value from settings where key='rate_agepots_per_token'`);
-  const rate = Math.max(1, Number(r.rows[0]?.value || 70));
-  return Math.ceil(Number(agePots || 0) / rate);
-}
-
-function normalizeAccountUsername(value) {
-  return String(value || "").trim();
-}
-
-// --------- DB INIT ----------
-async function initDb() {
-  await pool.query(`
-    create table if not exists users_local (
-      id bigserial primary key,
-      username text not null unique,
-      password_hash text not null,
-      balance_int bigint not null default 0,
-      is_admin boolean not null default false,
-      is_blacklisted boolean not null default false,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists settings (
-      key text primary key,
-      value text not null
-    );
-
-    create table if not exists products (
-      id bigserial primary key,
-      code text not null unique,
-      title text not null,
-      kind text not null default 'account',
-      age_pots int not null default 0,
-      bucks int not null default 0,
-      price_int bigint not null default 0,
-      stock_int int not null default 1,
-      note text not null default '',
-      image_url text not null default '',
-      sold boolean not null default false,
-      sold_at timestamptz,
-      purchases_count int not null default 0,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists orders (
-      id bigserial primary key,
-      user_id bigint references users_local(id),
-      status text not null default 'pending',
-      cart jsonb not null default '[]'::jsonb,
-      total_int bigint not null default 0,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists order_items (
-      id bigserial primary key,
-      order_id bigint references orders(id),
-      product_code text not null,
-      qty int not null default 1
-    );
-
-    create table if not exists payment_slots (
-      slot int primary key,
-      title text not null default '',
-      item_key text not null default '',
-      points_per_unit int not null default 0,
-      image_url text,
-      enabled boolean not null default false
-    );
-
-    create table if not exists expected_payments (
-      id bigserial primary key,
-      user_id bigint references users_local(id),
-      type text not null,
-      expected jsonb not null,
-      points_to_credit bigint not null,
-      receiver_account text not null,
-      status text not null default 'pending',
-      created_at timestamptz not null default now(),
-      expires_at timestamptz,
-      matched_at timestamptz,
-      matched_snapshot_id bigint
-    );
-
-    create table if not exists inventory_snapshots (
-      id bigserial primary key,
-      receiver_account text not null,
-      received_at timestamptz not null default now(),
-      data jsonb not null,
-      delta jsonb not null default '{}'::jsonb
-    );
-
-    create table if not exists account_credentials (
-      id bigserial primary key,
-      product_code text not null,
-      roblox_user text not null,
-      roblox_pass text not null,
-      note text not null default '',
-      age_pots int not null default 0,
-      bucks int not null default 0,
-      assigned_order_id bigint,
-      assigned_at timestamptz,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists token_ledger (
-      id bigserial primary key,
-      user_id bigint references users_local(id),
-      delta bigint not null,
-      reason text not null,
-      meta jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists account_twofa_codes (
-      id bigserial primary key,
-      account_username text not null,
-      code text not null,
-      source text not null default 'unknown',
-      message_id text,
-      channel_id text,
-      used boolean not null default false,
-      created_at timestamptz not null default now(),
-      expires_at timestamptz not null
-    );
-  `);
-
-  await pool.query(`
-    alter table products add column if not exists kind text not null default 'account';
-    alter table products add column if not exists sold boolean not null default false;
-    alter table products add column if not exists sold_at timestamptz;
-    alter table products add column if not exists purchases_count int not null default 0;
-    alter table products add column if not exists image_url text not null default '';
-
-    alter table users_local add column if not exists is_admin boolean not null default false;
-    alter table users_local add column if not exists is_blacklisted boolean not null default false;
-
-    alter table account_credentials add column if not exists age_pots int not null default 0;
-    alter table account_credentials add column if not exists bucks int not null default 0;
-
-    alter table inventory_snapshots add column if not exists delta jsonb not null default '{}'::jsonb;
-    alter table inventory_snapshots add column if not exists receiver_account text not null default 'unknown';
-    alter table inventory_snapshots add column if not exists received_at timestamptz not null default now();
-
-    alter table expected_payments add column if not exists expires_at timestamptz;
-    alter table expected_payments add column if not exists matched_at timestamptz;
-    alter table expected_payments add column if not exists matched_snapshot_id bigint;
-
-    alter table account_twofa_codes add column if not exists source text not null default 'unknown';
-    alter table account_twofa_codes add column if not exists message_id text;
-    alter table account_twofa_codes add column if not exists channel_id text;
-    alter table account_twofa_codes add column if not exists used boolean not null default false;
-    alter table account_twofa_codes add column if not exists created_at timestamptz not null default now();
-    alter table account_twofa_codes add column if not exists expires_at timestamptz;
-  `);
-
-  await pool.query(`
-    update expected_payments
-    set expires_at = created_at + interval '45 minutes'
-    where expires_at is null
-  `);
-
-  await pool.query(`
-    update account_twofa_codes
-    set expires_at = created_at + interval '5 minutes'
-    where expires_at is null
-  `);
-
-  await pool.query(`
-    do $$ begin
-      if exists (
-        select 1 from pg_constraint
-        where conname = 'account_credentials_product_code_key'
-      ) then
-        alter table account_credentials drop constraint account_credentials_product_code_key;
-      end if;
-    end $$;
-  `);
-
-  await pool.query(`
-    insert into settings (key,value)
-    values ('rate_agepots_per_token','70')
-    on conflict (key) do nothing;
-  `);
-
-  for (let i = 1; i <= 15; i++) {
-    await pool.query(
-      `insert into payment_slots (slot) values ($1) on conflict (slot) do nothing`,
-      [i]
-    );
-  }
-
-  const creds = await pool.query(`select id, roblox_pass from account_credentials`);
-  for (const row of creds.rows) {
-    const val = String(row.roblox_pass || "");
-    if (val && !val.includes(":")) {
-      await pool.query(
-        `update account_credentials set roblox_pass=$1 where id=$2`,
-        [encryptText(val), row.id]
-      );
-    }
-  }
-
-  await pool.query(`
-    create index if not exists idx_account_twofa_codes_account_username
-    on account_twofa_codes (account_username);
-
-    create index if not exists idx_account_twofa_codes_expires_at
-    on account_twofa_codes (expires_at);
-  `);
-}
-
 // ================= AUTH =================
 app.post("/api/auth/register", authLimiter, async (req, res) => {
   const username = String(req.body?.username || "").trim().toLowerCase();
@@ -722,6 +350,85 @@ app.post("/api/admin/credentials/import", adminLimiter, requireAuth, requireAdmi
     }
   }
   res.json({ ok: true, inserted, skipped, total: lines.length, products });
+});
+
+// ================= ADMIN: IMPORT PASSWORDS (update existing creds only) =================
+app.post("/api/admin/credentials/import-passwords", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  // Accepts body.text OR body.csv — one line per: username:newpassword
+  const raw = String(req.body?.text || req.body?.csv || "").trim();
+  if (!raw) return res.status(400).json({ ok: false, error: "text required" });
+
+  const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  let updated_available = 0, updated_sold = 0, skipped = 0;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const line of lines) {
+      const colonIdx = line.indexOf(":");
+      if (colonIdx < 1) { skipped++; continue; }
+      const roblox_user = line.slice(0, colonIdx).trim();
+      const new_pass    = line.slice(colonIdx + 1).trim();
+      if (!roblox_user || !new_pass) { skipped++; continue; }
+
+      // Find credential — case-insensitive, take latest if dupes
+      const credResult = await client.query(
+        `select id, assigned_order_id
+         from account_credentials
+         where lower(roblox_user) = lower($1)
+         order by id desc limit 1`,
+        [roblox_user]
+      );
+      if (!credResult.rows[0]) { skipped++; continue; }
+
+      const { id: credId, assigned_order_id } = credResult.rows[0];
+      await client.query(
+        `update account_credentials set roblox_pass = $1 where id = $2`,
+        [encryptText(new_pass), credId]
+      );
+
+      if (assigned_order_id && assigned_order_id > 0) {
+        // Also patch the password inside orders.cart so customer sees the new one
+        const orderResult = await client.query(
+          `select id, cart from orders where id = $1`,
+          [assigned_order_id]
+        );
+        for (const orderRow of orderResult.rows) {
+          const cart = Array.isArray(orderRow.cart) ? orderRow.cart : [];
+          let patched = false;
+          const newCart = cart.map((item) => {
+            if (item?.credentials?.user &&
+                item.credentials.user.toLowerCase() === roblox_user.toLowerCase()) {
+              patched = true;
+              return { ...item, credentials: { ...item.credentials, pass: new_pass } };
+            }
+            return item;
+          });
+          if (patched) {
+            await client.query(
+              `update orders set cart = $1 where id = $2`,
+              [JSON.stringify(newCart), orderRow.id]
+            );
+          }
+        }
+        updated_sold++;
+      } else {
+        updated_available++;
+      }
+    }
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("import-passwords error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "import failed" });
+  } finally {
+    client.release();
+  }
+
+  console.log(`Admin ${req.user.username} import-passwords: +${updated_available} avail, +${updated_sold} sold, ${skipped} skipped`);
+  res.json({ ok: true, updated_available, updated_sold, skipped, total: lines.length });
 });
 
 // ================= ORDERS =================
