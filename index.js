@@ -349,9 +349,11 @@ async function initDb() {
       bucks bigint not null default 0,
       age_pots bigint not null default 0,
       status text not null default 'active',
+      order_id bigint,
       completed_at timestamptz,
       created_at timestamptz not null default now()
     );
+    alter table ager_assignments add column if not exists order_id bigint;
   `);
 }
 
@@ -1277,12 +1279,13 @@ app.post("/api/aging/request-account", async (req, res) => {
 
 // Admin: assign account to ager for a ticket
 app.post("/api/admin/aging/assign-account", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
-  const { product_code, ager_discord_id, ticket_id } = req.body;
+  const { product_code, ager_discord_id, ticket_id, ager_site_username } = req.body;
   if (!product_code || !ager_discord_id) return res.status(400).json({ ok: false, error: "product_code and ager_discord_id required" });
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
     // Pull the credential
     const cred = await client.query(
       `select id, roblox_user, roblox_pass, note, age_pots, bucks from account_credentials
@@ -1290,27 +1293,91 @@ app.post("/api/admin/aging/assign-account", adminLimiter, requireAuth, requireAd
     );
     if (!cred.rows[0]) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: "no available credential for that product" }); }
 
-    // Mark product as sold/unavailable
-    await client.query(`update products set stock_int=0, sold=true where code=$1`, [product_code]);
-    // Mark cred as assigned to ager (use -999 sentinel for ager assignments)
-    await client.query(`update account_credentials set assigned_order_id=-999, assigned_at=now() where id=$1`, [cred.rows[0].id]);
+    // Find ager's site user ID if username provided
+    let agerUserId = null;
+    if (ager_site_username) {
+      const u = await client.query(`select id from users_local where lower(username)=lower($1)`, [ager_site_username]);
+      if (u.rows[0]) agerUserId = u.rows[0].id;
+    }
 
-    // Store in ager_assignments table
+    // Mark product as unavailable
+    await client.query(`update products set stock_int=0, sold=true where code=$1`, [product_code]);
+
+    let orderId = null;
+    if (agerUserId) {
+      // Create a real order tagged as ager assignment so it shows in My Accounts
+      const cartJson = JSON.stringify([{
+        code: product_code,
+        qty: 1,
+        credentials: {
+          user: cred.rows[0].roblox_user,
+          pass: decryptText(cred.rows[0].roblox_pass),
+          note: cred.rows[0].note,
+          age_pots: cred.rows[0].age_pots,
+          bucks: cred.rows[0].bucks,
+        },
+        is_ager_assignment: true,
+      }]);
+      const created = await client.query(
+        `insert into orders (user_id, cart, total_int, status) values ($1,$2,0,'completed') returning id`,
+        [agerUserId, cartJson]
+      );
+      orderId = created.rows[0].id;
+      await client.query(`update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`, [orderId, cred.rows[0].id]);
+    } else {
+      // No site account — use sentinel
+      await client.query(`update account_credentials set assigned_order_id=-999, assigned_at=now() where id=$1`, [cred.rows[0].id]);
+    }
+
+    // Store in ager_assignments
     await client.query(
-      `insert into ager_assignments (product_code, cred_id, ager_discord_id, ticket_id, roblox_user, roblox_pass, bucks, age_pots, status)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,'active')`,
+      `insert into ager_assignments (product_code, cred_id, ager_discord_id, ticket_id, roblox_user, roblox_pass, bucks, age_pots, status, order_id)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)`,
       [product_code, cred.rows[0].id, String(ager_discord_id), ticket_id || null,
-       cred.rows[0].roblox_user, encryptText(cred.rows[0].roblox_pass),
-       cred.rows[0].bucks, cred.rows[0].age_pots]
+       cred.rows[0].roblox_user, encryptText(decryptText(cred.rows[0].roblox_pass)),
+       cred.rows[0].bucks, cred.rows[0].age_pots, orderId]
     );
 
     await client.query("COMMIT");
-    res.json({ ok: true, roblox_user: cred.rows[0].roblox_user, bucks: cred.rows[0].bucks });
+    res.json({ ok: true, roblox_user: cred.rows[0].roblox_user, bucks: cred.rows[0].bucks, order_id: orderId });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("assign-account error:", e?.message);
     res.status(500).json({ ok: false, error: "assign failed" });
   } finally { client.release(); }
+});
+
+// Ager marks account as emptied (aged) from My Accounts tab
+app.post("/api/aging/mark-emptied", requireAuth, async (req, res) => {
+  const { order_id, product_code } = req.body;
+  if (!order_id) return res.status(400).json({ ok: false, error: "order_id required" });
+
+  // Verify this order belongs to the requesting user and is an ager assignment
+  const orderCheck = await pool.query(
+    `select id, cart from orders where id=$1 and user_id=$2`, [order_id, req.user.id]
+  );
+  if (!orderCheck.rows[0]) return res.status(404).json({ ok: false, error: "order not found" });
+
+  const cart = Array.isArray(orderCheck.rows[0].cart) ? orderCheck.rows[0].cart : [];
+  const isAgerAssignment = cart.some(i => i.is_ager_assignment === true);
+  if (!isAgerAssignment) return res.status(403).json({ ok: false, error: "not an ager assignment" });
+
+  // Find the assignment
+  const assignment = await pool.query(
+    `select * from ager_assignments where order_id=$1 and status='active' limit 1`, [order_id]
+  );
+  if (!assignment.rows[0]) return res.status(404).json({ ok: false, error: "assignment not found or already completed" });
+
+  await pool.query(`update ager_assignments set status='completed', completed_at=now() where id=$1`, [assignment.rows[0].id]);
+
+  // Return info for owner notification (bot/discord notif handled client-side or via separate webhook)
+  res.json({
+    ok: true,
+    roblox_user: assignment.rows[0].roblox_user,
+    bucks: assignment.rows[0].bucks,
+    product_code: assignment.rows[0].product_code,
+    ticket_id: assignment.rows[0].ticket_id,
+  });
 });
 
 // Bot: ager completes aging — returns account info for owner review
