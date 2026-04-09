@@ -1214,7 +1214,8 @@ app.post("/api/aging/link", requireAuth, async (req, res) => {
   if (order.rows[0].status !== "pending_payment")
     return res.status(400).json({ ok: false, error: "order already paid or completed" });
 
-  res.json({ ok: true, order: order.rows[0], user_balance: ME?.balance_int });
+  const userRow = await pool.query(`select balance_int from users_local where id=$1`, [req.user.id]);
+  res.json({ ok: true, order: order.rows[0], user_balance: userRow.rows[0]?.balance_int ?? 0 });
 });
 
 // Customer pays for aging order from their token balance
