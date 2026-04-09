@@ -21,6 +21,9 @@ const JWT_SECRET        = process.env.JWT_SECRET;
 const ADMIN_KEY         = process.env.ADMIN_KEY;
 const INVENTORY_API_KEY = process.env.INVENTORY_API_KEY;
 const TWOFA_INGEST_KEY  = process.env.TWOFA_INGEST_KEY || "";
+const NOWPAYMENTS_API_KEY   = process.env.NOWPAYMENTS_API_KEY || "";
+const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
+const NOWPAYMENTS_API = "https://api.nowpayments.io/v1";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
@@ -299,6 +302,21 @@ async function initDb() {
       expires_at timestamptz not null,
       used boolean not null default false,
       created_at timestamptz not null default now()
+    );
+    alter table users_local add column if not exists usd_balance numeric(12,4) not null default 0;
+    create table if not exists crypto_payments (
+      id bigserial primary key,
+      user_id bigint not null,
+      nowpayments_id text unique not null,
+      payment_status text not null default 'waiting',
+      pay_currency text not null,
+      pay_amount numeric(20,8),
+      price_amount numeric(12,4) not null,
+      pay_address text,
+      actually_paid numeric(20,8) default 0,
+      usd_credited numeric(12,4) default 0,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
     );
   `);
 }
@@ -926,6 +944,208 @@ app.get("/api/admin/orders", adminLimiter, requireAuth, requireAdmin, async (req
   `);
   res.json({ ok: true, orders: rows.rows });
 });
+
+// ================= CRYPTO PAYMENTS =================
+
+// Get user's USD balance
+app.get("/api/usd/balance", requireAuth, async (req, res) => {
+  const r = await pool.query(`select usd_balance from users_local where id=$1`, [req.user.id]);
+  res.json({ ok: true, usd_balance: Number(r.rows[0]?.usd_balance || 0) });
+});
+
+// Create a NOWPayments invoice
+app.post("/api/payments/crypto/create", requireAuth, async (req, res) => {
+  const currency = String(req.body?.currency || "").toLowerCase();
+  const amount   = Number(req.body?.amount || 0);
+
+  if (!["btc", "ltc"].includes(currency))
+    return res.status(400).json({ ok: false, error: "currency must be btc or ltc" });
+  if (amount < 5)
+    return res.status(400).json({ ok: false, error: "minimum deposit is $5.00" });
+  if (!NOWPAYMENTS_API_KEY)
+    return res.status(500).json({ ok: false, error: "crypto payments not configured" });
+
+  try {
+    const resp = await fetch(`${NOWPAYMENTS_API}/payment`, {
+      method: "POST",
+      headers: {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        price_amount: amount,
+        price_currency: "usd",
+        pay_currency: currency,
+        order_id: `user_${req.user.id}_${Date.now()}`,
+        order_description: `AdoptMeHub USD balance top-up for ${req.user.username}`,
+        ipn_callback_url: "https://api.adoptmehub.com/api/payments/crypto/webhook",
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok || !data.payment_id)
+      return res.status(500).json({ ok: false, error: data.message || "NOWPayments error" });
+
+    // Store in DB
+    await pool.query(
+      `insert into crypto_payments (user_id, nowpayments_id, payment_status, pay_currency, price_amount, pay_amount, pay_address)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [req.user.id, String(data.payment_id), data.payment_status, currency,
+       amount, data.pay_amount, data.pay_address]
+    );
+
+    res.json({
+      ok: true,
+      payment_id: data.payment_id,
+      pay_address: data.pay_address,
+      pay_amount: data.pay_amount,
+      pay_currency: currency.toUpperCase(),
+      price_amount: amount,
+      status: data.payment_status,
+    });
+  } catch (e) {
+    console.error("crypto/create error:", e?.message);
+    res.status(500).json({ ok: false, error: "failed to create payment" });
+  }
+});
+
+// Poll payment status
+app.get("/api/payments/crypto/status/:paymentId", requireAuth, async (req, res) => {
+  const r = await pool.query(
+    `select * from crypto_payments where nowpayments_id=$1 and user_id=$2`,
+    [req.params.paymentId, req.user.id]
+  );
+  if (!r.rows[0]) return res.status(404).json({ ok: false, error: "not found" });
+  res.json({ ok: true, payment: r.rows[0] });
+});
+
+// NOWPayments IPN webhook
+app.post("/api/payments/crypto/webhook", express.json(), async (req, res) => {
+  // Verify IPN signature
+  if (NOWPAYMENTS_IPN_SECRET) {
+    const sig = req.headers["x-nowpayments-sig"] || "";
+    const sorted = JSON.stringify(sortObject(req.body));
+    const expected = crypto.createHmac("sha512", NOWPAYMENTS_IPN_SECRET).update(sorted).digest("hex");
+    if (sig !== expected) {
+      console.error("IPN signature mismatch");
+      return res.status(400).json({ ok: false, error: "invalid signature" });
+    }
+  }
+
+  const { payment_id, payment_status, actually_paid, price_amount } = req.body;
+  if (!payment_id) return res.status(400).json({ ok: false, error: "missing payment_id" });
+
+  const confirmed = ["finished", "confirmed", "complete", "partially_paid"].includes(payment_status);
+
+  await pool.query(
+    `update crypto_payments set payment_status=$1, actually_paid=$2, updated_at=now() where nowpayments_id=$3`,
+    [payment_status, actually_paid || 0, String(payment_id)]
+  );
+
+  if (confirmed) {
+    // Only credit once — check usd_credited is 0
+    const r = await pool.query(
+      `select * from crypto_payments where nowpayments_id=$1 and usd_credited=0`,
+      [String(payment_id)]
+    );
+    if (r.rows[0]) {
+      const usdToCredit = Number(price_amount || r.rows[0].price_amount);
+      await pool.query(`update users_local set usd_balance = usd_balance + $1 where id=$2`, [usdToCredit, r.rows[0].user_id]);
+      await pool.query(`update crypto_payments set usd_credited=$1 where nowpayments_id=$2`, [usdToCredit, String(payment_id)]);
+      console.log(`Credited $${usdToCredit} USD to user ${r.rows[0].user_id} via crypto payment ${payment_id}`);
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+// USD order create (same credential assignment, deducts USD balance)
+app.post("/api/orders/create-usd", orderLimiter, requireAuth, async (req, res) => {
+  const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
+  if (!cart.length) return res.status(400).json({ ok: false, error: "empty cart" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const codes = [...new Set(cart.map((i) => String(i.code || "")))];
+    const prods = await client.query(
+      `select code, age_pots, stock_int, sold from products where code = any($1::text[]) for update`, [codes]
+    );
+    const map = new Map(prods.rows.map((p) => [p.code, p]));
+
+    // Calculate USD total: age_pots * $0.005
+    let totalUsd = 0;
+    for (const item of cart) {
+      const code = String(item.code || "");
+      const qty  = Math.max(1, Number(item.qty || 1));
+      const p    = map.get(code);
+      if (!p) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `unknown product: ${code}` }); }
+      if (p.sold || Number(p.stock_int) < qty) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `out of stock: ${code}` }); }
+      totalUsd += Number(p.age_pots) * 0.005 * qty;
+    }
+    totalUsd = Math.round(totalUsd * 10000) / 10000;
+
+    const userRow = await client.query(`select id, usd_balance from users_local where id=$1 for update`, [req.user.id]);
+    const user = userRow.rows[0];
+    if (!user) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, error: "user not found" }); }
+    if (Number(user.usd_balance) < totalUsd) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: `Not enough USD balance. Need $${totalUsd.toFixed(4)}, you have $${Number(user.usd_balance).toFixed(4)}.` });
+    }
+
+    await client.query(`update users_local set usd_balance = usd_balance - $1 where id=$2`, [totalUsd, req.user.id]);
+
+    const enrichedCart = [];
+    for (const item of cart) {
+      const code = String(item.code || "");
+      const qty  = Math.max(1, Number(item.qty || 1));
+      await client.query(`update products set stock_int = GREATEST(0, stock_int - $1), purchases_count = purchases_count + $1 where code = $2`, [qty, code]);
+      await client.query(`update products set sold = (stock_int <= 0), sold_at = case when stock_int <= 0 then now() else sold_at end where code = $1`, [code]);
+      const cred = await client.query(
+        `select id, roblox_user, roblox_pass, note, age_pots, bucks from account_credentials
+         where product_code = $1 and assigned_order_id is null order by id asc limit 1 for update skip locked`, [code]
+      );
+      let credentials = null, credId = null;
+      if (cred.rows[0]) {
+        credId = cred.rows[0].id;
+        credentials = { user: cred.rows[0].roblox_user, pass: decryptText(cred.rows[0].roblox_pass), note: cred.rows[0].note, age_pots: cred.rows[0].age_pots, bucks: cred.rows[0].bucks };
+        await client.query(`update account_credentials set assigned_order_id=-1 where id=$1`, [credId]);
+      }
+      enrichedCart.push({ code, qty, credentials, _credId: credId });
+    }
+
+    const created = await client.query(
+      `insert into orders (user_id, cart, total_int, status) values ($1::bigint,$2,$3,'completed') returning id, status, total_int, created_at`,
+      [req.user.id, JSON.stringify(enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials }))), Math.round(totalUsd * 100)]
+    );
+    const orderId = created.rows[0].id;
+
+    for (const item of enrichedCart) {
+      if (item._credId) await client.query(`update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`, [orderId, item._credId]);
+      await client.query(`insert into order_items(order_id,product_code,qty) values($1,$2,$3)`, [orderId, item.code, item.qty]);
+    }
+
+    await client.query("COMMIT");
+
+    const totalItems = enrichedCart.reduce((s, i) => s + i.qty, 0);
+    notifyPublic(req.user.username, totalItems).catch(console.error);
+    notifyAdmin({ username: req.user.username, orderId, totalTokens: `$${totalUsd.toFixed(2)} USD`, itemCount: totalItems, cartItems: enrichedCart }).catch(console.error);
+
+    res.json({ ok: true, order: { ...created.rows[0], usd_total: totalUsd, cart: enrichedCart.map((i) => ({ code: i.code, qty: i.qty, credentials: i.credentials })) } });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("orders/create-usd error:", err?.message || err);
+    res.status(500).json({ ok: false, error: "order failed" });
+  } finally { client.release(); }
+});
+
+// Helper to sort object keys for IPN signature
+function sortObject(obj) {
+  if (typeof obj !== "object" || obj === null) return obj;
+  if (Array.isArray(obj)) return obj.map(sortObject);
+  return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortObject(obj[k]); return acc; }, {});
+}
 
 // ================= AUTO-EXPIRE JOBS =================
 setInterval(async () => {
