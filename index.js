@@ -318,6 +318,40 @@ async function initDb() {
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now()
     );
+    create table if not exists aging_orders (
+      id bigserial primary key,
+      discord_user_id text not null,
+      discord_username text not null default '',
+      age_pots int not null,
+      price_tokens int not null,
+      ticket_id text,
+      status text not null default 'pending_payment',
+      paid_by_user_id bigint,
+      paid_at timestamptz,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists account_requests (
+      id bigserial primary key,
+      ager_discord_id text not null,
+      ager_username text not null default '',
+      ticket_id text,
+      status text not null default 'pending',
+      created_at timestamptz not null default now()
+    );
+    create table if not exists ager_assignments (
+      id bigserial primary key,
+      product_code text not null,
+      cred_id bigint not null,
+      ager_discord_id text not null,
+      ticket_id text,
+      roblox_user text not null,
+      roblox_pass text not null,
+      bucks bigint not null default 0,
+      age_pots bigint not null default 0,
+      status text not null default 'active',
+      completed_at timestamptz,
+      created_at timestamptz not null default now()
+    );
   `);
 }
 
@@ -1146,6 +1180,176 @@ function sortObject(obj) {
   if (Array.isArray(obj)) return obj.map(sortObject);
   return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortObject(obj[k]); return acc; }, {});
 }
+
+// ================= AGING SERVICE =================
+
+// Bot creates an aging order and gets back a pending payment ID
+app.post("/api/aging/create", async (req, res) => {
+  const bot_secret = req.headers["x-bot-secret"] || "";
+  if (bot_secret !== (process.env.BOT_SECRET || "")) return res.status(403).json({ ok: false, error: "forbidden" });
+
+  const { discord_user_id, discord_username, age_pots, ticket_id } = req.body;
+  if (!discord_user_id || !age_pots || age_pots < 1)
+    return res.status(400).json({ ok: false, error: "discord_user_id and age_pots required" });
+
+  const price_tokens = Math.ceil(Number(age_pots) / 70);
+
+  // Find user by discord_user_id if linked, else store pending
+  const r = await pool.query(
+    `insert into aging_orders (discord_user_id, discord_username, age_pots, price_tokens, ticket_id, status)
+     values ($1,$2,$3,$4,$5,'pending_payment') returning id`,
+    [String(discord_user_id), discord_username || "", Number(age_pots), price_tokens, ticket_id || null]
+  );
+
+  res.json({ ok: true, aging_order_id: r.rows[0].id, price_tokens, age_pots: Number(age_pots) });
+});
+
+// Customer links their site account to their aging order
+app.post("/api/aging/link", requireAuth, async (req, res) => {
+  const { aging_order_id } = req.body;
+  if (!aging_order_id) return res.status(400).json({ ok: false, error: "aging_order_id required" });
+
+  const order = await pool.query(`select * from aging_orders where id=$1`, [aging_order_id]);
+  if (!order.rows[0]) return res.status(404).json({ ok: false, error: "aging order not found" });
+  if (order.rows[0].status !== "pending_payment")
+    return res.status(400).json({ ok: false, error: "order already paid or completed" });
+
+  res.json({ ok: true, order: order.rows[0], user_balance: ME?.balance_int });
+});
+
+// Customer pays for aging order from their token balance
+app.post("/api/aging/pay", requireAuth, async (req, res) => {
+  const { aging_order_id } = req.body;
+  if (!aging_order_id) return res.status(400).json({ ok: false, error: "aging_order_id required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const order = await client.query(`select * from aging_orders where id=$1 for update`, [aging_order_id]);
+    if (!order.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, error: "not found" }); }
+    if (order.rows[0].status !== "pending_payment") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "already paid" });
+    }
+
+    const price = Number(order.rows[0].price_tokens);
+    const userRow = await client.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
+    if (!userRow.rows[0] || Number(userRow.rows[0].balance_int) < price) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: `Not enough tokens. Need ${price}, you have ${userRow.rows[0]?.balance_int || 0}.` });
+    }
+
+    await client.query(`update users_local set balance_int = balance_int - $1 where id=$2`, [price, req.user.id]);
+    await client.query(`update aging_orders set status='paid', paid_by_user_id=$1, paid_at=now() where id=$2`, [req.user.id, aging_order_id]);
+    await client.query(`insert into token_ledger (user_id, delta, reason, meta) values ($1,$2,'aging_service',$3::jsonb)`,
+      [req.user.id, -price, JSON.stringify({ aging_order_id, age_pots: order.rows[0].age_pots })]);
+    await client.query("COMMIT");
+
+    res.json({ ok: true, paid: true, tokens_spent: price, age_pots: order.rows[0].age_pots });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("aging/pay error:", e?.message);
+    res.status(500).json({ ok: false, error: "payment failed" });
+  } finally { client.release(); }
+});
+
+// Bot polls this to check if customer paid
+app.get("/api/aging/status/:id", async (req, res) => {
+  const bot_secret = req.headers["x-bot-secret"] || "";
+  if (bot_secret !== (process.env.BOT_SECRET || "")) return res.status(403).json({ ok: false, error: "forbidden" });
+  const r = await pool.query(`select * from aging_orders where id=$1`, [req.params.id]);
+  if (!r.rows[0]) return res.status(404).json({ ok: false, error: "not found" });
+  res.json({ ok: true, order: r.rows[0] });
+});
+
+// Bot: ager requests an account — just logs it, owner handles on website
+app.post("/api/aging/request-account", async (req, res) => {
+  const bot_secret = req.headers["x-bot-secret"] || "";
+  if (bot_secret !== (process.env.BOT_SECRET || "")) return res.status(403).json({ ok: false, error: "forbidden" });
+  const { ager_discord_id, ager_username, ticket_id } = req.body;
+  await pool.query(
+    `insert into account_requests (ager_discord_id, ager_username, ticket_id, status) values ($1,$2,$3,'pending')`,
+    [String(ager_discord_id), ager_username || "", ticket_id || null]
+  );
+  res.json({ ok: true });
+});
+
+// Admin: assign account to ager for a ticket
+app.post("/api/admin/aging/assign-account", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const { product_code, ager_discord_id, ticket_id } = req.body;
+  if (!product_code || !ager_discord_id) return res.status(400).json({ ok: false, error: "product_code and ager_discord_id required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Pull the credential
+    const cred = await client.query(
+      `select id, roblox_user, roblox_pass, note, age_pots, bucks from account_credentials
+       where product_code=$1 and assigned_order_id is null order by id asc limit 1 for update skip locked`, [product_code]
+    );
+    if (!cred.rows[0]) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: "no available credential for that product" }); }
+
+    // Mark product as sold/unavailable
+    await client.query(`update products set stock_int=0, sold=true where code=$1`, [product_code]);
+    // Mark cred as assigned to ager (use -999 sentinel for ager assignments)
+    await client.query(`update account_credentials set assigned_order_id=-999, assigned_at=now() where id=$1`, [cred.rows[0].id]);
+
+    // Store in ager_assignments table
+    await client.query(
+      `insert into ager_assignments (product_code, cred_id, ager_discord_id, ticket_id, roblox_user, roblox_pass, bucks, age_pots, status)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,'active')`,
+      [product_code, cred.rows[0].id, String(ager_discord_id), ticket_id || null,
+       cred.rows[0].roblox_user, encryptText(cred.rows[0].roblox_pass),
+       cred.rows[0].bucks, cred.rows[0].age_pots]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, roblox_user: cred.rows[0].roblox_user, bucks: cred.rows[0].bucks });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("assign-account error:", e?.message);
+    res.status(500).json({ ok: false, error: "assign failed" });
+  } finally { client.release(); }
+});
+
+// Bot: ager completes aging — returns account info for owner review
+app.post("/api/aging/complete", async (req, res) => {
+  const bot_secret = req.headers["x-bot-secret"] || "";
+  if (bot_secret !== (process.env.BOT_SECRET || "")) return res.status(403).json({ ok: false, error: "forbidden" });
+
+  const { roblox_username, ager_discord_id } = req.body;
+  if (!roblox_username) return res.status(400).json({ ok: false, error: "roblox_username required" });
+
+  const r = await pool.query(
+    `select * from ager_assignments where lower(roblox_user)=lower($1) and status='active' order by id desc limit 1`,
+    [roblox_username]
+  );
+  if (!r.rows[0]) return res.status(404).json({ ok: false, error: "no active assignment found for that username" });
+
+  const assignment = r.rows[0];
+  await pool.query(`update ager_assignments set status='completed', completed_at=now() where id=$1`, [assignment.id]);
+
+  res.json({
+    ok: true,
+    roblox_user: assignment.roblox_user,
+    bucks: assignment.bucks,
+    age_pots_before: assignment.age_pots,
+    product_code: assignment.product_code,
+    ticket_id: assignment.ticket_id,
+  });
+});
+
+// Admin: get pending account requests
+app.get("/api/admin/aging/requests", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const r = await pool.query(`select * from account_requests where status='pending' order by id desc`);
+  res.json({ ok: true, requests: r.rows });
+});
+
+// Admin: get completed aging assignments (for relisting)
+app.get("/api/admin/aging/completed", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const r = await pool.query(`select * from ager_assignments where status='completed' order by completed_at desc limit 50`);
+  res.json({ ok: true, assignments: r.rows });
+});
 
 // ================= AUTO-EXPIRE JOBS =================
 setInterval(async () => {
