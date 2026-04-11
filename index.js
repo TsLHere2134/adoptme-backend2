@@ -351,6 +351,15 @@ async function initDb() {
       used boolean not null default false,
       created_at timestamptz not null default now()
     );
+    create table if not exists email_verifications (
+      id bigserial primary key,
+      user_id bigint not null,
+      email text not null,
+      code text not null,
+      expires_at timestamptz not null,
+      used boolean not null default false,
+      created_at timestamptz not null default now()
+    );
     create table if not exists crypto_payments (
       id bigserial primary key,
       user_id bigint not null,
@@ -563,16 +572,63 @@ app.get("/api/auth/csrf", (req, res) => {
   res.json({ ok: true, csrf: token });
 });
 
-// Update email for logged-in user
-app.post("/api/me/email", requireAuth, async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase() || null;
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+// Step 1: Send verification code to email
+app.post("/api/me/email/send-code", requireAuth, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return res.status(400).json({ ok: false, error: "invalid email" });
+
+  // Check not already used by another account
+  const existing = await pool.query(
+    `select id from users_local where lower(email)=$1 and id != $2`, [email, req.user.id]
+  );
+  if (existing.rows[0]) return res.status(400).json({ ok: false, error: "email already used by another account" });
+
+  const code = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
+  const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+  // Delete any old codes for this user
+  await pool.query(`delete from email_verifications where user_id=$1`, [req.user.id]);
+  await pool.query(
+    `insert into email_verifications (user_id, email, code, expires_at) values ($1,$2,$3,$4)`,
+    [req.user.id, email, code, expires]
+  );
+
+  const sent = await sendEmail({
+    to: email,
+    subject: "Verify your email — AdoptMeHub",
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
+        <h2 style="margin:0 0 16px">Verify your email</h2>
+        <p>Enter this code on AdoptMeHub to confirm your email address. It expires in 15 minutes.</p>
+        <div style="font-size:36px;font-weight:900;letter-spacing:8px;text-align:center;padding:24px;background:#f5f5f5;border-radius:12px;margin:16px 0">${code}</div>
+        <p style="color:#888;font-size:13px">If you didn't request this, ignore this email.</p>
+      </div>
+    `,
+  });
+
+  if (!sent) return res.status(500).json({ ok: false, error: "Failed to send email. Make sure your domain is verified on Resend." });
+  res.json({ ok: true });
+});
+
+// Step 2: Confirm code and save email
+app.post("/api/me/email/verify-code", requireAuth, async (req, res) => {
+  const code = String(req.body?.code || "").trim();
+  if (!code) return res.status(400).json({ ok: false, error: "code required" });
+
+  const r = await pool.query(
+    `select * from email_verifications where user_id=$1 and used=false and expires_at > now() order by id desc limit 1`,
+    [req.user.id]
+  );
+  if (!r.rows[0]) return res.status(400).json({ ok: false, error: "No pending verification. Request a new code." });
+  if (r.rows[0].code !== code) return res.status(400).json({ ok: false, error: "Incorrect code." });
+
   try {
-    await pool.query(`update users_local set email=$1 where id=$2`, [email, req.user.id]);
-    res.json({ ok: true });
+    await pool.query(`update users_local set email=$1 where id=$2`, [r.rows[0].email, req.user.id]);
+    await pool.query(`update email_verifications set used=true where id=$1`, [r.rows[0].id]);
+    res.json({ ok: true, email: r.rows[0].email });
   } catch {
-    res.status(400).json({ ok: false, error: "email already in use by another account" });
+    res.status(400).json({ ok: false, error: "email already used by another account" });
   }
 });
 app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
