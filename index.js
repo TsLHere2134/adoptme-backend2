@@ -25,6 +25,8 @@ const TWOFA_INGEST_KEY  = process.env.TWOFA_INGEST_KEY || "";
 const NOWPAYMENTS_API_KEY   = process.env.NOWPAYMENTS_API_KEY || "";
 const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
 const NOWPAYMENTS_API = "https://api.nowpayments.io/v1";
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
+const RESEND_API_KEY   = process.env.RESEND_API_KEY   || "";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
@@ -161,7 +163,35 @@ async function notifyAdmin({ username, orderId, totalTokens, itemCount, cartItem
   } catch (e) { console.error("notifyAdmin error:", e?.message); }
 }
 
-// ===== AUTH MIDDLEWARE =====
+// ===== TURNSTILE VERIFICATION =====
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET) return true; // skip if not configured
+  if (!token) return false;
+  try {
+    const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: TURNSTILE_SECRET, response: token, remoteip: ip }),
+    });
+    const data = await resp.json();
+    return data.success === true;
+  } catch { return false; }
+}
+
+// ===== EMAIL HELPER (Resend) =====
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) { console.warn("RESEND_API_KEY not set — skipping email"); return false; }
+  try {
+    const resp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "AdoptMeHub <noreply@adoptmehub.com>", to, subject, html }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { console.error("Resend error:", data); return false; }
+    return true;
+  } catch (e) { console.error("sendEmail error:", e?.message); return false; }
+}
 const JWT_COOKIE = "amh_token";
 
 const requireAuth = (req, res, next) => {
@@ -311,6 +341,16 @@ async function initDb() {
       created_at timestamptz not null default now()
     );
     alter table users_local add column if not exists usd_balance numeric(12,4) not null default 0;
+    alter table users_local add column if not exists email text;
+    create unique index if not exists users_local_email_unique on users_local (lower(email)) where email is not null;
+    create table if not exists password_resets (
+      id bigserial primary key,
+      user_id bigint not null,
+      token text unique not null,
+      expires_at timestamptz not null,
+      used boolean not null default false,
+      created_at timestamptz not null default now()
+    );
     create table if not exists crypto_payments (
       id bigserial primary key,
       user_id bigint not null,
@@ -441,13 +481,22 @@ const twofaLimiter     = rateLimit({ windowMs:  1 * 60 * 1000, max: 180, standar
 app.post("/api/auth/register", authLimiter, async (req, res) => {
   const username = String(req.body?.username || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
+  const email    = String(req.body?.email || "").trim().toLowerCase() || null;
+  const cfToken  = String(req.body?.cf_turnstile_response || "");
+
   if (username.length < 3) return res.status(400).json({ ok: false, error: "username too short" });
   if (password.length < 6) return res.status(400).json({ ok: false, error: "password too short (min 6)" });
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ ok: false, error: "invalid email" });
+
+  // Verify Turnstile captcha
+  const turnstileOk = await verifyTurnstile(cfToken, req.ip);
+  if (!turnstileOk) return res.status(400).json({ ok: false, error: "Captcha failed — please try again." });
+
   const hash = await bcrypt.hash(password, 10);
   try {
     const ins = await pool.query(
-      `insert into users_local (username,password_hash) values ($1,$2) returning id,username,balance_int,is_admin,created_at`,
-      [username, hash]
+      `insert into users_local (username, password_hash, email) values ($1,$2,$3) returning id,username,balance_int,is_admin,created_at`,
+      [username, hash, email]
     );
     const user = ins.rows[0];
     const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, { expiresIn: "30d" });
@@ -512,6 +561,57 @@ app.post("/api/auth/logout", (req, res) => {
 app.get("/api/auth/csrf", (req, res) => {
   const token = setCsrfCookie(res);
   res.json({ ok: true, csrf: token });
+});
+
+// ===== PASSWORD RESET =====
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ ok: false, error: "email required" });
+
+  // Always return ok to prevent email enumeration
+  const u = await pool.query(`select id, username from users_local where lower(email)=$1`, [email]);
+  if (!u.rows[0]) return res.json({ ok: true });
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+  await pool.query(
+    `insert into password_resets (user_id, token, expires_at) values ($1,$2,$3)`,
+    [u.rows[0].id, token, expires]
+  );
+
+  const resetUrl = `https://adoptmehub.com?reset=${token}`;
+  await sendEmail({
+    to: email,
+    subject: "Reset your AdoptMeHub password",
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px">
+        <h2 style="margin:0 0 16px">Reset your password</h2>
+        <p>Hi <b>${u.rows[0].username}</b>, click the button below to reset your password. This link expires in 1 hour.</p>
+        <a href="${resetUrl}" style="display:inline-block;margin:16px 0;padding:12px 24px;background:#8b7cf6;color:#fff;border-radius:8px;text-decoration:none;font-weight:700">Reset Password</a>
+        <p style="color:#888;font-size:13px">If you didn't request this, ignore this email. Your password won't change.</p>
+      </div>
+    `,
+  });
+
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ ok: false, error: "token and password required" });
+  if (password.length < 6) return res.status(400).json({ ok: false, error: "password too short (min 6)" });
+
+  const r = await pool.query(
+    `select * from password_resets where token=$1 and used=false and expires_at > now()`, [token]
+  );
+  if (!r.rows[0]) return res.status(400).json({ ok: false, error: "Invalid or expired reset link." });
+
+  const hash = await bcrypt.hash(password, 10);
+  await pool.query(`update users_local set password_hash=$1 where id=$2`, [hash, r.rows[0].user_id]);
+  await pool.query(`update password_resets set used=true where id=$1`, [r.rows[0].id]);
+
+  res.json({ ok: true });
 });
 
 // ================= SETTINGS =================
