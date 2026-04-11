@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
 
 const app = express();
 
@@ -161,9 +162,15 @@ async function notifyAdmin({ username, orderId, totalTokens, itemCount, cartItem
 }
 
 // ===== AUTH MIDDLEWARE =====
+const JWT_COOKIE = "amh_token";
+
 const requireAuth = (req, res, next) => {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  // Read from httpOnly cookie first, fall back to Authorization header
+  let token = req.cookies?.[JWT_COOKIE] || "";
+  if (!token) {
+    const header = req.headers.authorization || "";
+    token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  }
   if (!token) return res.status(401).json({ ok: false, error: "auth required" });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -362,7 +369,43 @@ app.set("trust proxy", 1);
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 app.get("/", (req, res) => res.status(200).send("API running ✅"));
 app.use(helmet());
+app.use(cookieParser());
 app.use(express.json({ limit: "1mb" }));
+
+// ===== CSRF PROTECTION =====
+const CSRF_COOKIE = "amh_csrf";
+const CSRF_HEADER = "x-csrf-token";
+
+function generateCsrfToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function setCsrfCookie(res) {
+  const token = generateCsrfToken();
+  res.cookie(CSRF_COOKIE, token, {
+    httpOnly: false, // must be readable by JS so it can be sent in header
+    sameSite: "strict",
+    secure: process.env.NODE_ENV !== "development",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+  return token;
+}
+
+// Middleware to verify CSRF token on state-changing requests
+const requireCsrf = (req, res, next) => {
+  // Skip CSRF for GET, HEAD, OPTIONS and for inventory/bot endpoints that use API keys
+  if (["GET","HEAD","OPTIONS"].includes(req.method)) return next();
+  const skipPaths = ["/inventory", "/inventory.php", "/api/twofa/ingest", "/api/payments/crypto/webhook"];
+  if (skipPaths.some(p => req.path.startsWith(p))) return next();
+  const cookieToken = req.cookies?.[CSRF_COOKIE];
+  const headerToken = req.headers?.[CSRF_HEADER];
+  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    return res.status(403).json({ ok: false, error: "invalid csrf token" });
+  }
+  next();
+};
+
+app.use(requireCsrf);
 
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && "body" in err) {
@@ -377,8 +420,9 @@ app.use((req, res, next) => {
   if (origin && FRONTEND_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key, x-twofa-key");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-inventory-key, x-admin-key, x-twofa-key, x-csrf-token");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -407,7 +451,14 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     );
     const user = ins.rows[0];
     const token = jwt.sign({ id: user.id, username: user.username, is_admin: user.is_admin }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ ok: true, token, user });
+    res.cookie(JWT_COOKIE, token, {
+      httpOnly: true,
+      sameSite: "strict",
+      secure: process.env.NODE_ENV !== "development",
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+    });
+    const csrfToken = setCsrfCookie(res);
+    res.json({ ok: true, user, csrf: csrfToken });
   } catch {
     res.status(400).json({ ok: false, error: "username already used" });
   }
@@ -428,8 +479,16 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
     { id: u.rows[0].id, username: u.rows[0].username, is_admin: u.rows[0].is_admin },
     JWT_SECRET, { expiresIn: "30d" }
   );
+  res.cookie(JWT_COOKIE, token, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV !== "development",
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+  const csrfToken = setCsrfCookie(res);
   res.json({
-    ok: true, token,
+    ok: true,
+    csrf: csrfToken,
     user: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, is_admin: u.rows[0].is_admin, created_at: u.rows[0].created_at },
   });
 });
@@ -441,6 +500,18 @@ app.get("/api/me", requireAuth, async (req, res) => {
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
   res.json({ ok: true, me: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, is_admin: u.rows[0].is_admin, created_at: u.rows[0].created_at } });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  res.clearCookie(JWT_COOKIE, { sameSite: "strict", secure: process.env.NODE_ENV !== "development" });
+  res.clearCookie(CSRF_COOKIE, { sameSite: "strict", secure: process.env.NODE_ENV !== "development" });
+  res.json({ ok: true });
+});
+
+// Issue a fresh CSRF token (called on page load)
+app.get("/api/auth/csrf", (req, res) => {
+  const token = setCsrfCookie(res);
+  res.json({ ok: true, csrf: token });
 });
 
 // ================= SETTINGS =================
