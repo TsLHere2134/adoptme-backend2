@@ -544,11 +544,11 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const u = await pool.query(
-    `select id,username,balance_int,is_admin,is_blacklisted,created_at from users_local where id=$1`, [req.user.id]
+    `select id,username,balance_int,is_admin,is_blacklisted,created_at,email from users_local where id=$1`, [req.user.id]
   );
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
-  res.json({ ok: true, me: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, is_admin: u.rows[0].is_admin, created_at: u.rows[0].created_at } });
+  res.json({ ok: true, me: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, is_admin: u.rows[0].is_admin, created_at: u.rows[0].created_at, email: u.rows[0].email || "" } });
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -563,7 +563,18 @@ app.get("/api/auth/csrf", (req, res) => {
   res.json({ ok: true, csrf: token });
 });
 
-// ===== PASSWORD RESET =====
+// Update email for logged-in user
+app.post("/api/me/email", requireAuth, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase() || null;
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return res.status(400).json({ ok: false, error: "invalid email" });
+  try {
+    await pool.query(`update users_local set email=$1 where id=$2`, [email, req.user.id]);
+    res.json({ ok: true });
+  } catch {
+    res.status(400).json({ ok: false, error: "email already in use by another account" });
+  }
+});
 app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   if (!email) return res.status(400).json({ ok: false, error: "email required" });
