@@ -30,7 +30,7 @@ const RESEND_API_KEY   = process.env.RESEND_API_KEY   || "";
 const DISCORD_CLIENT_ID     = process.env.DISCORD_CLIENT_ID     || "1481453931904237619";
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
 const DISCORD_REDIRECT_URI  = "https://api.adoptmehub.com/api/auth/discord/callback";
-const DISCORD_GUILD_ID      = String(GUILD_ID || process.env.DISCORD_GUILD_ID || "1470472204872585449");
+const DISCORD_GUILD_ID      = process.env.DISCORD_GUILD_ID || "1470472204872585449";
 const BOT_TOKEN             = process.env.DISCORD_BOT_TOKEN || "";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
