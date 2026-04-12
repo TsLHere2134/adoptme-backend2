@@ -1421,7 +1421,29 @@ function sortObject(obj) {
   return Object.keys(obj).sort().reduce((acc, k) => { acc[k] = sortObject(obj[k]); return acc; }, {});
 }
 
-// ================= AGING SERVICE =================
+// Public user profile lookup
+app.get("/api/users/:username/profile", async (req, res) => {
+  const username = String(req.params.username || "").trim().toLowerCase();
+  const u = await pool.query(
+    `select id, username, balance_int, created_at from users_local where lower(username)=$1 and is_blacklisted=false`,
+    [username]
+  );
+  if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
+  const orders = await pool.query(
+    `select count(*) as order_count, coalesce(sum(total_int),0) as total_spent from orders where user_id=$1 and status='completed'`,
+    [u.rows[0].id]
+  );
+  res.json({
+    ok: true,
+    user: {
+      username: u.rows[0].username,
+      balance_int: u.rows[0].balance_int,
+      created_at: u.rows[0].created_at,
+      order_count: Number(orders.rows[0].order_count),
+      total_spent: Number(orders.rows[0].total_spent),
+    }
+  });
+});
 
 // Bot creates an aging order and gets back a pending payment ID
 app.post("/api/aging/create", async (req, res) => {
