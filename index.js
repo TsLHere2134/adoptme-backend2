@@ -27,6 +27,11 @@ const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
 const NOWPAYMENTS_API = "https://api.nowpayments.io/v1";
 const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || "";
 const RESEND_API_KEY   = process.env.RESEND_API_KEY   || "";
+const DISCORD_CLIENT_ID     = process.env.DISCORD_CLIENT_ID     || "1481453931904237619";
+const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET || "";
+const DISCORD_REDIRECT_URI  = "https://api.adoptmehub.com/api/auth/discord/callback";
+const DISCORD_GUILD_ID      = String(GUILD_ID || process.env.DISCORD_GUILD_ID || "1470472204872585449");
+const BOT_TOKEN             = process.env.DISCORD_BOT_TOKEN || "";
 
 const DISCORD_PUBLIC_WEBHOOK = process.env.DISCORD_PUBLIC_WEBHOOK || "";
 const DISCORD_ADMIN_WEBHOOK  = process.env.DISCORD_ADMIN_WEBHOOK  || "";
@@ -351,7 +356,14 @@ async function initDb() {
       used boolean not null default false,
       created_at timestamptz not null default now()
     );
-    create table if not exists email_verifications (
+    create table if not exists discord_links (
+      id bigserial primary key,
+      user_id bigint unique not null,
+      discord_id text unique not null,
+      discord_username text not null,
+      linked_at timestamptz not null default now()
+    );
+    alter table users_local add column if not exists discord_verified boolean not null default false;
       id bigserial primary key,
       user_id bigint not null,
       email text not null,
@@ -553,11 +565,19 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   const u = await pool.query(
-    `select id,username,balance_int,is_admin,is_blacklisted,created_at,email from users_local where id=$1`, [req.user.id]
+    `select id,username,balance_int,is_admin,is_blacklisted,created_at,email,discord_verified from users_local where id=$1`, [req.user.id]
   );
   if (!u.rows[0]) return res.status(404).json({ ok: false, error: "user not found" });
   if (u.rows[0].is_blacklisted) return res.status(403).json({ ok: false, error: "blacklisted" });
-  res.json({ ok: true, me: { id: u.rows[0].id, username: u.rows[0].username, balance_int: u.rows[0].balance_int, is_admin: u.rows[0].is_admin, created_at: u.rows[0].created_at, email: u.rows[0].email || "" } });
+  res.json({ ok: true, me: {
+    id: u.rows[0].id,
+    username: u.rows[0].username,
+    balance_int: u.rows[0].balance_int,
+    is_admin: u.rows[0].is_admin,
+    created_at: u.rows[0].created_at,
+    email: u.rows[0].email || "",
+    discord_verified: u.rows[0].discord_verified || false,
+  }});
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -631,6 +651,94 @@ app.post("/api/me/email/verify-code", requireAuth, async (req, res) => {
     res.status(400).json({ ok: false, error: "email already used by another account" });
   }
 });
+
+// ===== DISCORD OAUTH =====
+
+app.get("/api/auth/discord", requireAuth, (req, res) => {
+  const params = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    redirect_uri: DISCORD_REDIRECT_URI,
+    response_type: "code",
+    scope: "identify guilds.members.read",
+    state: req.user.id.toString(),
+  });
+  res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
+});
+
+app.get("/api/auth/discord/callback", async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.redirect("https://adoptmehub.com?discord=error");
+  const userId = Number(state);
+  if (!userId) return res.redirect("https://adoptmehub.com?discord=error");
+
+  try {
+    const tokenResp = await fetch("https://discord.com/api/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type: "authorization_code",
+        code, redirect_uri: DISCORD_REDIRECT_URI,
+      }),
+    });
+    const tokenData = await tokenResp.json();
+    if (!tokenData.access_token) return res.redirect("https://adoptmehub.com?discord=error");
+
+    const userResp = await fetch("https://discord.com/api/users/@me", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const discordUser = await userResp.json();
+    if (!discordUser.id) return res.redirect("https://adoptmehub.com?discord=error");
+
+    // Check they're in the server
+    const memberResp = await fetch(`https://discord.com/api/users/@me/guilds/${DISCORD_GUILD_ID}/member`, {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    if (!memberResp.ok) return res.redirect("https://adoptmehub.com?discord=not_in_server");
+
+    const u = await pool.query(`select username from users_local where id=$1`, [userId]);
+    if (!u.rows[0]) return res.redirect("https://adoptmehub.com?discord=error");
+    const siteUsername = u.rows[0].username;
+
+    // Save link
+    await pool.query(
+      `insert into discord_links (user_id, discord_id, discord_username)
+       values ($1,$2,$3)
+       on conflict (user_id) do update set discord_id=$2, discord_username=$3, linked_at=now()`,
+      [userId, discordUser.id, `${discordUser.username}#${discordUser.discriminator || "0"}`]
+    );
+    await pool.query(`update users_local set discord_verified=true where id=$1`, [userId]);
+
+    // Rename in server using bot token
+    if (BOT_TOKEN) {
+      try {
+        await fetch(`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUser.id}`, {
+          method: "PATCH",
+          headers: { Authorization: `Bot ${BOT_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ nick: siteUsername }),
+        });
+      } catch (e) { console.error("Discord rename error:", e?.message); }
+    }
+
+    res.redirect("https://adoptmehub.com?discord=success");
+  } catch (e) {
+    console.error("Discord OAuth error:", e?.message);
+    res.redirect("https://adoptmehub.com?discord=error");
+  }
+});
+
+app.get("/api/me/discord", requireAuth, async (req, res) => {
+  const r = await pool.query(`select * from discord_links where user_id=$1`, [req.user.id]);
+  const u = await pool.query(`select discord_verified from users_local where id=$1`, [req.user.id]);
+  res.json({
+    ok: true,
+    linked: !!r.rows[0],
+    discord_username: r.rows[0]?.discord_username || null,
+    verified: u.rows[0]?.discord_verified || false,
+  });
+});
+
 app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   if (!email) return res.status(400).json({ ok: false, error: "email required" });
