@@ -459,6 +459,8 @@ const requireCsrf = (req, res, next) => {
     "/inventory", "/inventory.php", "/api/twofa/ingest",
     "/api/payments/crypto/webhook",
     "/api/auth/register", "/api/auth/login", "/api/auth/logout",
+    "/api/aging/create", "/api/aging/status", "/api/aging/complete",
+    "/api/aging/request-account",
   ];
   if (skipPaths.some(p => req.path.startsWith(p))) return next();
   const cookieToken = req.cookies?.[CSRF_COOKIE];
