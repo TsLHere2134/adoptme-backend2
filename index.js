@@ -454,9 +454,12 @@ function setCsrfCookie(res) {
 
 // Middleware to verify CSRF token on state-changing requests
 const requireCsrf = (req, res, next) => {
-  // Skip CSRF for GET, HEAD, OPTIONS and for inventory/bot endpoints that use API keys
   if (["GET","HEAD","OPTIONS"].includes(req.method)) return next();
-  const skipPaths = ["/inventory", "/inventory.php", "/api/twofa/ingest", "/api/payments/crypto/webhook"];
+  const skipPaths = [
+    "/inventory", "/inventory.php", "/api/twofa/ingest",
+    "/api/payments/crypto/webhook",
+    "/api/auth/register", "/api/auth/login", "/api/auth/logout",
+  ];
   if (skipPaths.some(p => req.path.startsWith(p))) return next();
   const cookieToken = req.cookies?.[CSRF_COOKIE];
   const headerToken = req.headers?.[CSRF_HEADER];
@@ -529,8 +532,11 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     });
     const csrfToken = setCsrfCookie(res);
     res.json({ ok: true, user, csrf: csrfToken });
-  } catch {
-    res.status(400).json({ ok: false, error: "username already used" });
+  } catch(e) {
+    const msg = e?.constraint === "users_local_email_unique"
+      ? "email already used by another account"
+      : "username already taken";
+    res.status(400).json({ ok: false, error: msg });
   }
 });
 
@@ -1715,7 +1721,83 @@ app.post("/api/admin/aging/assign-account", adminLimiter, requireAuth, requireAd
   } finally { client.release(); }
 });
 
-// Ager marks account as emptied (aged) from My Accounts tab
+// Customer transfers an order to an ager
+app.post("/api/orders/transfer", requireAuth, async (req, res) => {
+  const { order_id, ager_username } = req.body;
+  if (!order_id || !ager_username)
+    return res.status(400).json({ ok: false, error: "order_id and ager_username required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Verify order belongs to requesting user
+    const orderRow = await client.query(
+      `select id, cart, user_id from orders where id=$1 and user_id=$2 for update`,
+      [order_id, req.user.id]
+    );
+    if (!orderRow.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "order not found" });
+    }
+
+    // Check order isn't already transferred
+    const cart = Array.isArray(orderRow.rows[0].cart) ? orderRow.rows[0].cart : [];
+    if (cart.some(i => i.transferred)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "already transferred" });
+    }
+
+    // Find ager by username
+    const agerRow = await client.query(
+      `select id, username from users_local where lower(username)=lower($1)`, [ager_username]
+    );
+    if (!agerRow.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "ager not found — check the username" });
+    }
+    if (agerRow.rows[0].id === req.user.id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "you can't transfer to yourself" });
+    }
+
+    // Mark cart items as ager assignment + transferred
+    const newCart = cart.map(item => ({
+      ...item,
+      is_ager_assignment: true,
+      transferred: true,
+      transferred_from: req.user.id,
+      transferred_from_username: req.user.username,
+    }));
+
+    // Create new order for ager
+    const newOrder = await client.query(
+      `insert into orders (user_id, cart, total_int, status) values ($1,$2,0,'completed') returning id`,
+      [agerRow.rows[0].id, JSON.stringify(newCart)]
+    );
+
+    // Update credentials assignment
+    for (const item of cart) {
+      if (item.credentials?.user) {
+        await client.query(
+          `update account_credentials set assigned_order_id=$1 where lower(roblox_user)=lower($2)`,
+          [newOrder.rows[0].id, item.credentials.user]
+        );
+      }
+    }
+
+    // Remove order from customer (mark as transferred)
+    const transferredCart = cart.map(i => ({ ...i, transferred: true, transferred_to: agerRow.rows[0].username }));
+    await client.query(`update orders set cart=$1 where id=$2`, [JSON.stringify(transferredCart), order_id]);
+
+    await client.query("COMMIT");
+    res.json({ ok: true, ager_username: agerRow.rows[0].username });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("transfer error:", e?.message);
+    res.status(500).json({ ok: false, error: "transfer failed" });
+  } finally { client.release(); }
+});
 app.post("/api/aging/mark-emptied", requireAuth, async (req, res) => {
   const { order_id, product_code } = req.body;
   if (!order_id) return res.status(400).json({ ok: false, error: "order_id required" });
