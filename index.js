@@ -346,6 +346,7 @@ async function initDb() {
       created_at timestamptz not null default now()
     );
     alter table users_local add column if not exists usd_balance numeric(12,4) not null default 0;
+    alter table products add column if not exists candy bigint not null default 0;
     alter table users_local add column if not exists email text;
     create unique index if not exists users_local_email_unique on users_local (lower(email)) where email is not null;
     create table if not exists password_resets (
@@ -815,12 +816,12 @@ app.post("/api/admin/settings", adminLimiter, requireAdminKey, async (req, res) 
 // ================= PRODUCTS =================
 app.get("/api/products", async (req, res) => {
   const rows = await pool.query(`
-    select p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
+    select p.id, p.code, p.title, p.kind, p.age_pots, p.bucks, p.candy,
       p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count,
       count(c.id) filter (where c.assigned_order_id is null) as cred_count
     from products p
     left join account_credentials c on c.product_code = p.code
-    group by p.id, p.code, p.title, p.kind, p.age_pots, p.bucks,
+    group by p.id, p.code, p.title, p.kind, p.age_pots, p.bucks, p.candy,
       p.price_int, p.stock_int, p.note, p.image_url, p.sold, p.purchases_count, p.created_at
     order by p.created_at desc
   `);
@@ -888,19 +889,20 @@ app.post("/api/admin/products/upsert", adminLimiter, requireAuth, requireAdmin, 
   const stock_int = Math.max(0, Math.trunc(Number(p.stock_int ?? 1)));
   const age_pots  = Math.max(0, Math.trunc(Number(p.age_pots  || 0)));
   const bucks     = Math.max(0, Math.trunc(Number(p.bucks     || 0)));
+  const candy     = Math.max(0, Math.trunc(Number(p.candy     || 0)));
   const note      = String(p.note      || "");
   const image_url = String(p.image_url || "");
   const kind      = String(p.kind      || "account");
   const sold      = stock_int <= 0;
   const q = await pool.query(
-    `insert into products (code,title,kind,age_pots,bucks,price_int,stock_int,note,image_url,sold)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `insert into products (code,title,kind,age_pots,bucks,candy,price_int,stock_int,note,image_url,sold)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      on conflict (code) do update set
        title=excluded.title, kind=excluded.kind, age_pots=excluded.age_pots, bucks=excluded.bucks,
-       price_int=excluded.price_int, stock_int=excluded.stock_int, note=excluded.note,
-       image_url=excluded.image_url, sold=excluded.sold
+       candy=excluded.candy, price_int=excluded.price_int, stock_int=excluded.stock_int,
+       note=excluded.note, image_url=excluded.image_url, sold=excluded.sold
      returning *;`,
-    [code, title, kind, age_pots, bucks, price_int, stock_int, note, image_url, sold]
+    [code, title, kind, age_pots, bucks, candy, price_int, stock_int, note, image_url, sold]
   );
   res.json({ ok: true, product: q.rows[0] });
 });
