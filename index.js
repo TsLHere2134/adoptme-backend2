@@ -1029,7 +1029,7 @@ app.post("/api/admin/credentials/import-event", adminLimiter, requireAuth, requi
     if (!roblox_user || !roblox_pass) { skipped++; continue; }
 
     const censored  = roblox_user[0] + "*".repeat(Math.max(1, roblox_user.length - 1));
-    const price_int = Math.ceil(age_pots / 70);
+    const price_int = Math.ceil(age_pots / 80);
     const code      = "EVT_" + makeCode(roblox_user);
 
     try {
