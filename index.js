@@ -1008,7 +1008,53 @@ app.post("/api/admin/credentials/import", adminLimiter, requireAuth, requireAdmi
   res.json({ ok: true, inserted, skipped, total: lines.length, products });
 });
 
-// ================= ADMIN: IMPORT PASSWORDS =================
+// ================= ADMIN: IMPORT EVENT CREDENTIALS =================
+app.post("/api/admin/credentials/import-event", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const csv = String(req.body?.csv || "").trim();
+  if (!csv) return res.status(400).json({ ok: false, error: "csv required" });
+  const lines = csv.split("\n").map(l => l.trim()).filter(Boolean);
+  let inserted = 0, skipped = 0;
+  const products = [];
+
+  for (const line of lines) {
+    // Format: user:pass:agepots:bucks:candy
+    const parts = line.split(":");
+    if (parts.length < 5) { skipped++; continue; }
+    const [roblox_user_raw, roblox_pass_raw, age_pots_raw, bucks_raw, candy_raw] = parts;
+    const roblox_user = roblox_user_raw?.trim();
+    const roblox_pass = roblox_pass_raw?.trim();
+    const age_pots    = Math.max(0, Number(age_pots_raw?.trim() || 0));
+    const bucks       = Math.max(0, Number(bucks_raw?.trim()    || 0));
+    const candy       = Math.max(0, Number(candy_raw?.trim()    || 0));
+    if (!roblox_user || !roblox_pass) { skipped++; continue; }
+
+    const censored  = roblox_user[0] + "*".repeat(Math.max(1, roblox_user.length - 1));
+    const price_int = Math.ceil(age_pots / 80);
+    const code      = "EVT_" + makeCode(roblox_user);
+
+    try {
+      await pool.query(
+        `insert into products (code, title, kind, age_pots, bucks, candy, price_int, stock_int, note, sold)
+         values ($1, $2, 'event', $3, $4, $5, $6, 1, '', false)
+         on conflict (code) do update set
+           age_pots=excluded.age_pots, bucks=excluded.bucks, candy=excluded.candy,
+           price_int=excluded.price_int, stock_int=products.stock_int + 1, sold=false`,
+        [code, censored, age_pots, bucks, candy, price_int]
+      );
+      await pool.query(
+        `insert into account_credentials (product_code, roblox_user, roblox_pass, note, age_pots, bucks)
+         values ($1, $2, $3, $4, $5, $6)`,
+        [code, roblox_user, encryptText(roblox_pass), `candy:${candy}`, age_pots, bucks]
+      );
+      products.push(code);
+      inserted++;
+    } catch (e) {
+      console.error("event import row error:", e?.message);
+      skipped++;
+    }
+  }
+  res.json({ ok: true, inserted, skipped, total: lines.length, products });
+});
 app.post("/api/admin/credentials/import-passwords", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
   const raw = String(req.body?.text || req.body?.csv || "").trim();
   if (!raw) return res.status(400).json({ ok: false, error: "text required" });
