@@ -1113,14 +1113,16 @@ app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
   try {
     await client.query("BEGIN");
     const codes = [...new Set(cart.map((i) => String(i.code || "")))];
-    const prods = await client.query(`select code, price_int, stock_int, sold from products where code = any($1::text[]) for update`, [codes]);
+    const prods = await client.query(`select code, age_pots, price_int, stock_int, sold from products where code = any($1::text[]) for update`, [codes]);
     const map = new Map(prods.rows.map((p) => [p.code, p]));
     let total = 0;
     for (const item of cart) {
       const code = String(item.code || ""); const qty = Math.max(1, Number(item.qty || 1)); const p = map.get(code);
       if (!p) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `unknown product: ${code}` }); }
       if (p.sold || Number(p.stock_int) < qty) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, error: `out of stock: ${code}` }); }
-      total += Number(p.price_int) * qty;
+      // Price by age_pots: ceil(age_pots / 70) per account
+      const accTokens = Math.ceil(Number(p.age_pots || 0) / 70) || 1;
+      total += accTokens * qty;
     }
     const userRow = await client.query(`select id, balance_int from users_local where id=$1 for update`, [req.user.id]);
     const user = userRow.rows[0];
