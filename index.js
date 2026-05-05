@@ -1105,6 +1105,91 @@ app.post("/api/admin/credentials/import-passwords", adminLimiter, requireAuth, r
   res.json({ ok: true, updated_available, updated_sold, skipped, total: lines.length });
 });
 
+// ================= ADMIN: INVENTORY STATS =================
+app.get("/api/admin/inventory-stats", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Aggregate stats for all currently-for-sale (unsold) account listings
+    const statsRow = await pool.query(`
+      select
+        count(*)::int                    as total_accounts,
+        coalesce(sum(p.age_pots), 0)::bigint as total_age_pots,
+        coalesce(sum(p.bucks), 0)::bigint    as total_bucks,
+        coalesce(sum(p.price_int), 0)::bigint as total_tokens
+      from products p
+      where p.sold = false and p.stock_int > 0
+    `);
+
+    // Also grab per-account breakdown for the download
+    const listRows = await pool.query(`
+      select
+        p.code, p.title, p.age_pots, p.bucks, p.price_int, p.stock_int,
+        ac.roblox_user, ac.roblox_pass, ac.note
+      from products p
+      left join account_credentials ac
+        on ac.product_code = p.code and ac.assigned_order_id is null
+      where p.sold = false and p.stock_int > 0
+      order by p.created_at desc
+    `);
+
+    res.json({
+      ok: true,
+      stats: statsRow.rows[0],
+      accounts: listRows.rows.map(r => ({
+        code: r.code,
+        title: r.title,
+        age_pots: r.age_pots,
+        bucks: r.bucks,
+        price_int: r.price_int,
+        stock_int: r.stock_int,
+        roblox_user: r.roblox_user || null,
+      })),
+    });
+  } catch (e) {
+    console.error("inventory-stats error:", e?.message);
+    res.status(500).json({ ok: false, error: "stats query failed" });
+  }
+});
+
+// ================= ADMIN: EXPORT CREDENTIALS (owner-only download) =================
+// Returns decrypted user:pass for all currently-available accounts
+app.get("/api/admin/export-credentials", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rows = await pool.query(`
+      select
+        ac.roblox_user,
+        ac.roblox_pass,
+        ac.age_pots,
+        ac.bucks,
+        ac.note,
+        p.code,
+        p.title
+      from account_credentials ac
+      join products p on p.code = ac.product_code
+      where ac.assigned_order_id is null
+        and p.sold = false
+        and p.stock_int > 0
+      order by p.created_at desc, ac.id asc
+    `);
+
+    const lines = rows.rows.map(r => {
+      const user = r.roblox_user || "";
+      const pass = decryptText(r.roblox_pass || "");
+      const age  = r.age_pots ?? 0;
+      const bucks = r.bucks ?? 0;
+      const note = r.note ? `:${r.note}` : "";
+      return `${user}:${pass}:${age}:${bucks}${note}`;
+    });
+
+    const csv = lines.join("\n");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="accounts_export_${Date.now()}.txt"`);
+    res.send(csv);
+  } catch (e) {
+    console.error("export-credentials error:", e?.message);
+    res.status(500).json({ ok: false, error: "export failed" });
+  }
+});
+
 // ================= ORDERS =================
 app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
