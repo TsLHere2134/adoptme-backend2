@@ -1934,7 +1934,56 @@ setInterval(async () => {
     await pool.query(`delete from account_twofa_codes where expires_at <= now()`);
   } catch (e) { console.error("2FA cleanup error:", e?.message || e); }
 }, 60_000);
+// ================= ADMIN GLOBAL STATS + EXPORT =================
 
+// GET total stats of all UNSOLD accounts
+app.get("/api/admin/global-stats", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT 
+        COUNT(*)::int as total_accounts,
+        COALESCE(SUM(ac.age_pots),0)::bigint as total_age_pots,
+        COALESCE(SUM(ac.bucks),0)::bigint as total_bucks
+      FROM account_credentials ac
+      JOIN products p ON p.code = ac.product_code
+      WHERE p.sold = false
+    `);
+
+    res.json({ ok: true, stats: q.rows[0] });
+
+  } catch (err) {
+    console.error("GLOBAL STATS ERROR:", err);
+    res.status(500).json({ ok: false });
+  }
+});
+
+
+// DOWNLOAD accounts
+app.get("/api/admin/download-accounts", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT 
+        ac.roblox_user,
+        ac.roblox_pass,
+        ac.note as cookie
+      FROM account_credentials ac
+      JOIN products p ON p.code = ac.product_code
+      WHERE p.sold = false
+    `);
+
+    const content = q.rows.map(r =>
+      `${r.roblox_user}:${r.roblox_pass}:${r.cookie || ""}`
+    ).join("\n");
+
+    res.setHeader("Content-Disposition", "attachment; filename=accounts.txt");
+    res.setHeader("Content-Type", "text/plain");
+    res.send(content);
+
+  } catch (err) {
+    console.error("DOWNLOAD ERROR:", err);
+    res.status(500).json({ ok: false });
+  }
+});
 // ================= START =================
 console.log("PORT ENV =", process.env.PORT);
 const PORT = Number(process.env.PORT || 8080);
