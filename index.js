@@ -1116,7 +1116,7 @@ app.get("/api/admin/inventory-stats", adminLimiter, requireAuth, requireAdmin, a
         coalesce(sum(p.bucks), 0)::bigint    as total_bucks,
         coalesce(sum(p.price_int), 0)::bigint as total_tokens
       from products p
-      where p.sold = false and p.stock_int > 0
+      where p.sold = false and p.stock_int > 0 and p.kind != 'event'
     `);
 
     // Also grab per-account breakdown for the download
@@ -1127,7 +1127,7 @@ app.get("/api/admin/inventory-stats", adminLimiter, requireAuth, requireAdmin, a
       from products p
       left join account_credentials ac
         on ac.product_code = p.code and ac.assigned_order_id is null
-      where p.sold = false and p.stock_int > 0
+      where p.sold = false and p.stock_int > 0 and p.kind != 'event'
       order by p.created_at desc
     `);
 
@@ -1168,6 +1168,7 @@ app.get("/api/admin/export-credentials", adminLimiter, requireAuth, requireAdmin
       where ac.assigned_order_id is null
         and p.sold = false
         and p.stock_int > 0
+        and p.kind != 'event'
       order by p.created_at desc, ac.id asc
     `);
 
