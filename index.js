@@ -1191,6 +1191,125 @@ app.get("/api/admin/export-credentials", adminLimiter, requireAuth, requireAdmin
   }
 });
 
+// ================= ADMIN: BULK TRANSFER ALL UNSOLD TO USER =================
+app.post("/api/admin/bulk-transfer", adminLimiter, requireAuth, requireAdmin, async (req, res) => {
+  const targetUsername = String(req.body?.username || "").trim().toLowerCase();
+  if (!targetUsername) return res.status(400).json({ ok: false, error: "username required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Lock and fetch the target user
+    const userRow = await client.query(
+      `select id, username from users_local where lower(username)=$1 for update`,
+      [targetUsername]
+    );
+    if (!userRow.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: `User "${targetUsername}" not found` });
+    }
+    const targetUser = userRow.rows[0];
+
+    // Grab all unsold, non-event products with available credentials
+    const products = await client.query(
+      `select p.code, p.title, p.age_pots, p.bucks, p.price_int, p.stock_int
+       from products p
+       where p.sold = false and p.stock_int > 0 and p.kind != 'event'
+       for update`,
+    );
+    if (!products.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "No unsold accounts to transfer" });
+    }
+
+    // For each product grab ALL unassigned credentials
+    const enrichedCart = [];
+    for (const prod of products.rows) {
+      const creds = await client.query(
+        `select id, roblox_user, roblox_pass, note, age_pots, bucks
+         from account_credentials
+         where product_code=$1 and assigned_order_id is null
+         order by id asc
+         for update skip locked`,
+        [prod.code]
+      );
+      for (const cred of creds.rows) {
+        enrichedCart.push({
+          code: prod.code,
+          title: prod.title,
+          qty: 1,
+          _credId: cred.id,
+          credentials: {
+            user: cred.roblox_user,
+            pass: decryptText(cred.roblox_pass || ""),
+            note: cred.note,
+            age_pots: cred.age_pots,
+            bucks: cred.bucks,
+          },
+        });
+      }
+      // Mark product as fully sold out
+      await client.query(
+        `update products set stock_int=0, sold=true, sold_at=now() where code=$1`,
+        [prod.code]
+      );
+    }
+
+    if (!enrichedCart.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "No credentials available to transfer" });
+    }
+
+    // Create a single completed order for the target user (0 token cost — already paid externally)
+    const orderPayload = enrichedCart.map(i => ({
+      code: i.code,
+      qty: i.qty,
+      credentials: i.credentials,
+    }));
+    const created = await client.query(
+      `insert into orders (user_id, cart, total_int, status)
+       values ($1::bigint, $2, 0, 'completed')
+       returning id, created_at`,
+      [targetUser.id, JSON.stringify(orderPayload)]
+    );
+    const orderId = created.rows[0].id;
+
+    // Assign all credentials to this order
+    for (const item of enrichedCart) {
+      await client.query(
+        `update account_credentials set assigned_order_id=$1, assigned_at=now() where id=$2`,
+        [orderId, item._credId]
+      );
+      await client.query(
+        `insert into order_items (order_id, product_code, qty) values ($1,$2,$3)
+         on conflict do nothing`,
+        [orderId, item.code, item.qty]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    console.log(
+      `Admin ${req.user.username} bulk-transferred ${enrichedCart.length} accounts ` +
+      `to user "${targetUser.username}" via order #${orderId}`
+    );
+
+    res.json({
+      ok: true,
+      order_id: orderId,
+      transferred: enrichedCart.length,
+      username: targetUser.username,
+    });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("bulk-transfer error:", e?.message);
+    res.status(500).json({ ok: false, error: "bulk transfer failed" });
+  } finally {
+    client.release();
+  }
+});
+
 // ================= ORDERS =================
 app.post("/api/orders/create", orderLimiter, requireAuth, async (req, res) => {
   const cart = Array.isArray(req.body?.cart) ? req.body.cart : [];
